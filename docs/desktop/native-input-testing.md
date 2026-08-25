@@ -12,7 +12,12 @@ manual matrix without explicit authorization from the machine owner.
   locally verified with injected filesystem/input-source adapters, fake
   transcript, and a real ad-hoc-signed IME/Bridge peer exchange.
 - Hidden-palette user-level install/repair registration, enablement, selection,
-  verification, and rollback: automated; installed-app rerun pending.
+  verification, and rollback: automated. On the current macOS 26.5.1 arm64
+  machine, the per-user Debug/ad-hoc and Apple Development-signed probes both
+  returned success from register/enable but remained disabled; select returned
+  `paramErr` (`-50`). The transaction rolled back and left the keyboard source
+  unchanged. A system-level installation probe or Developer ID/notarized
+  artifact is the next explicit authorization/release gate.
 - Cross-application InputMethodKit interaction: verified with fake transcript in
   TextEdit and Safari textarea/contenteditable/password controls. Terminal and
   the broader application matrix remain open.
@@ -109,7 +114,7 @@ unlisted rows remain unverified.
 | Area | Scenario and expected result | Status |
 | --- | --- | --- |
 | Install | User-level install rejects symlinks/wrong owner or signature; no admin prompt | PASS (Debug/ad-hoc) |
-| Hidden palette | Explicit Install/Repair produces registered + enabled + selected while the ordinary keyboard source ID remains unchanged | NOT RUN after lifecycle change |
+| Hidden palette | Explicit Install/Repair produces registered + enabled + selected while the ordinary keyboard source ID remains unchanged | BLOCKED: per-user local signatures remain disabled; system-level or release-signed gate required |
 | TextEdit / Notes | Partial is marked; final is committed at the caret; physical typing is preserved | PASS (TextEdit) |
 | Safari textarea | Partial/final/edit remain on one locked target | PASS |
 | Safari contenteditable | UTF-16 range and caret movement behave deterministically | PASS |

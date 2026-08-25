@@ -67,10 +67,11 @@ targets:
         CFBundleVersion: "1"
         LSBackgroundOnly: true
         LSMinimumSystemVersion: "13.0"
+        NSPrincipalClass: NSApplication
         InputMethodConnectionName: ai.qwenaudio.agent.inputmethod.connection
         ComponentInvisibleInSystemUI: true
         InputMethodServerControllerClass: QwenInputController
-        InputMethodType: Palette
+        InputMethodType: palette
         TISInputSourceID: ai.qwenaudio.agent.inputmethod
         TISIntendedLanguage: en
     settings:

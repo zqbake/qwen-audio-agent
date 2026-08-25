@@ -78,13 +78,19 @@ test('builds an inert current-architecture Bridge and InputMethodKit bundle', {
       '-extract', 'InputMethodType', 'raw', '-o', '-', inputMethodInfo,
     ])
     assert.equal(inputType.status, 0, inputType.stderr)
-    assert.equal(inputType.stdout.trim(), 'Palette')
+    assert.equal(inputType.stdout.trim(), 'palette')
 
     const invisible = run('plutil', [
       '-extract', 'ComponentInvisibleInSystemUI', 'raw', '-o', '-', inputMethodInfo,
     ])
     assert.equal(invisible.status, 0, invisible.stderr)
     assert.equal(invisible.stdout.trim(), 'true')
+
+    const principalClass = run('plutil', [
+      '-extract', 'NSPrincipalClass', 'raw', '-o', '-', inputMethodInfo,
+    ])
+    assert.equal(principalClass.status, 0, principalClass.stderr)
+    assert.equal(principalClass.stdout.trim(), 'NSApplication')
 
     const bridgeArchitectures = run('lipo', ['-archs', bridge])
     assert.equal(bridgeArchitectures.status, 0, bridgeArchitectures.stderr)

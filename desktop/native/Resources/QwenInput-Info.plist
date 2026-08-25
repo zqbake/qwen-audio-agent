@@ -27,11 +27,13 @@
 	<key>InputMethodServerControllerClass</key>
 	<string>QwenInputController</string>
 	<key>InputMethodType</key>
-	<string>Palette</string>
+	<string>palette</string>
 	<key>LSBackgroundOnly</key>
 	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
 	<key>TISInputSourceID</key>
 	<string>ai.qwenaudio.agent.inputmethod</string>
 	<key>TISIntendedLanguage</key>

@@ -10,7 +10,10 @@ macOS 输入源状态；未经机器所有者明确授权，不得执行人工�
 - Desktop 生命周期与 IME→Bridge→Gateway 自动化链：已使用注入式文件系统/
   输入源适配器、fake transcript 和真实 ad-hoc 签名 IME/Bridge peer 往返验证。
 - 隐藏 palette 的用户级安装/修复、注册、启用、选择、校验和失败回滚：自动化
-  已覆盖，安装 App 真机复跑待完成。
+  已覆盖。当前 macOS 26.5.1 arm64 真机上，per-user Debug/ad-hoc 与 Apple
+  Development 签名探针均显示 register/enable 返回成功但状态仍 disabled，select
+  返回 `paramErr`（`-50`）；事务已回滚且普通键盘 source 不变。下一步明确门禁是
+  系统级安装探针，或 Developer ID/公证产物。
 - 跨应用 InputMethodKit 真实交互：已用 fake transcript 验证 TextEdit 与
   Safari textarea/contenteditable/password；Terminal 和更广应用矩阵仍未完成。
 - 物理麦克风与 TCC 授权链路：未运行。
@@ -97,7 +100,7 @@ fake transcript。正式签名与未列为通过的场景仍未验证。
 | 范围 | 场景与预期 | 状态 |
 | --- | --- | --- |
 | 安装 | 用户级安装拒绝符号链接、错误属主/签名，且不弹管理员密码 | 通过（Debug/ad-hoc） |
-| 隐藏 palette | 明确安装/修复后 registered + enabled + selected，普通键盘 source ID 不变 | 生命周期变更后未运行 |
+| 隐藏 palette | 明确安装/修复后 registered + enabled + selected，普通键盘 source ID 不变 | 阻塞：per-user 本地签名保持 disabled；需系统级或发布签名门禁 |
 | TextEdit / Notes | partial 有 marked 样式，final 落在光标处，物理打字不被吞 | TextEdit 通过 |
 | Safari textarea | partial/final/edit 始终锁定同一目标 | 通过 |
 | Safari contenteditable | UTF-16 范围和光标移动行为确定 | 通过 |
