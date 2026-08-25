@@ -63,6 +63,10 @@ import {
   desktopRealtimeRuntime,
   resolveDesktopRuntime,
 } from './desktop-runtime.js'
+import {
+  spriteAnimationEventForGatewayEvent,
+  spriteAnimationForEvent,
+} from './sprite-orb.js'
 
 const desktopOrbMode = (
   new URLSearchParams(window.location.search).get('desktop') === 'orb'
@@ -197,7 +201,7 @@ export default function App() {
   })
   const [orbDragging, setOrbDragging] = useState(false)
   const [orbDragDirection, setOrbDragDirection] = useState('')
-  const [spriteAnimationCue, setSpriteAnimationCue] = useState(null)
+  const [spriteAnimationCues, setSpriteAnimationCues] = useState([])
   const [spriteOrbFailed, setSpriteOrbFailed] = useState(false)
   const [desktopLifecycle, setDesktopLifecycle] = useState('active')
   const [desktopSurfaceMode, setDesktopSurfaceMode] = useState(
@@ -215,11 +219,13 @@ export default function App() {
   const orbDrag = useRef(null)
   const spriteAnimationCueId = useRef(0)
   const runtimeReadyAnnounced = useRef(false)
-  const previousDesktopRuntime = useRef('starting')
   const previousWorkSettled = useRef(true)
   const workSettledAtRef = useRef(workSettledAt)
   const lastWakeAtRef = useRef(0)
   const dictationEventId = useRef(0)
+  const orbVisualStateRef = useRef('idle')
+  const previousDesktopLifecycle = useRef('active')
+  const spriteAnimationCue = spriteAnimationCues[0] || null
 
   const noteInteraction = useCallback(() => {
     setLastInteractionAt(Date.now())
@@ -237,14 +243,21 @@ export default function App() {
     }
   }, [noteInteraction])
 
-  const triggerSpriteAnimation = useCallback(name => {
+  const triggerSpriteAnimation = useCallback((eventName, { priority = false } = {}) => {
     if (!desktopOrbMode || isBuiltinOrbSkin(orbSkinId)) return
+    const name = spriteAnimationForEvent(eventName)
+    if (!name) return
     spriteAnimationCueId.current += 1
-    setSpriteAnimationCue({ id: spriteAnimationCueId.current, name })
+    const cue = { id: spriteAnimationCueId.current, name }
+    setSpriteAnimationCues(current => (
+      priority ? [cue, ...current] : [...current, cue]
+    ))
   }, [])
 
   const completeSpriteAnimationCue = useCallback(id => {
-    setSpriteAnimationCue(current => current?.id === id ? null : current)
+    setSpriteAnimationCues(current => (
+      current[0]?.id === id ? current.slice(1) : current
+    ))
   }, [])
 
   const respondToPermission = useCallback(async (taskId, permission, decision) => {
@@ -461,6 +474,13 @@ export default function App() {
         id: dictationEventId.current,
         event: { ...event, receivedAt: Date.now() },
       }))
+    }
+    const animationEvent = spriteAnimationEventForGatewayEvent(event)
+    if (
+      animationEvent
+      && !(animationEvent === 'query' && orbVisualStateRef.current === 'processing')
+    ) {
+      triggerSpriteAnimation(animationEvent)
     }
     if (event.type === 'turn.started') {
       noteInteraction()
@@ -726,7 +746,6 @@ export default function App() {
     }
     if (event.type === 'task.failed') {
       const failed = event.task
-      triggerSpriteAnimation('failed')
       if (failed.turnId) agentTurnIds.current.delete(failed.turnId)
       if (!failed.turnId || failed.turnId === currentTurnId.current) {
         setActivity(t('后台失败：{error}', { error: failed.error }))
@@ -842,6 +861,7 @@ export default function App() {
     tasksActive: desktopHasActiveTasks,
     attentionPending: desktopOrbMode && desktopTasksAttention(agentTasks),
   })
+  orbVisualStateRef.current = orbVisualState
   const attentionTask = agentTasks.find(
     task => task.authorization?.status === 'pending',
   )
@@ -849,15 +869,12 @@ export default function App() {
   useEffect(() => {
     if (!desktopOrbMode) return
     const current = desktopRuntime.overall
-    const previous = previousDesktopRuntime.current
     const presentation = advanceDesktopRuntimePresentation({
       current,
-      previous,
       readyAnnounced: runtimeReadyAnnounced.current,
     })
     runtimeReadyAnnounced.current = presentation.readyAnnounced
     if (presentation.cue) triggerSpriteAnimation(presentation.cue)
-    previousDesktopRuntime.current = current
   }, [desktopRuntime.overall, triggerSpriteAnimation])
 
   const desktopCards = useMemo(
@@ -925,6 +942,13 @@ export default function App() {
     if (!bridge) return undefined
     const applyLifecycle = lifecycle => {
       if (!lifecycle?.state) return
+      if (
+        lifecycle.state === 'waking'
+        && previousDesktopLifecycle.current !== 'waking'
+      ) {
+        triggerSpriteAnimation('wake', { priority: true })
+      }
+      previousDesktopLifecycle.current = lifecycle.state
       setDesktopLifecycle(lifecycle.state)
       if (lifecycle.state === 'waking') lastWakeAtRef.current = Date.now()
       if (lifecycle.reason === 'activity') noteInteraction()
@@ -945,7 +969,7 @@ export default function App() {
       window.removeEventListener('pointerdown', onInteraction)
       window.removeEventListener('keydown', onInteraction)
     }
-  }, [noteInteraction])
+  }, [noteInteraction, triggerSpriteAnimation])
 
   useEffect(() => {
     if (!desktopOrbMode || desktopLifecycle !== 'waking') return
@@ -1151,7 +1175,7 @@ export default function App() {
               ? t('{holder}正在使用语音', { holder: ownershipLabel })
               : labelFor(orbVisualState))
         }
-        onPointerEnter={() => triggerSpriteAnimation('jumping')}
+        onPointerEnter={() => triggerSpriteAnimation('hover')}
         onPointerDown={beginOrbDrag}
         onPointerMove={moveOrb}
         onPointerUp={endOrbDrag}

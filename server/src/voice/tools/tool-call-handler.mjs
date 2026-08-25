@@ -103,6 +103,7 @@ export class ToolCallHandler {
     permissionPolicy,
     onPermissionDeliveryFailed = () => {},
     requestClientState = () => {},
+    onAgentActivity = () => {},
     inputAssets = null,
   }) {
     this.taskManager = taskManager
@@ -123,6 +124,7 @@ export class ToolCallHandler {
     this.permissionPolicy = permissionPolicy
     this.onPermissionDeliveryFailed = onPermissionDeliveryFailed
     this.requestClientState = requestClientState
+    this.onAgentActivity = onAgentActivity
     this.inputAssets = inputAssets
     this.gatewayApprovedPermissions = new Set()
     this.processedCalls = new Set()
@@ -294,6 +296,7 @@ export class ToolCallHandler {
     inputParts = [],
   }) {
     let workId = ''
+    let requestId = ''
     const task = this.taskManager.create({
       objective,
       ownerId: this.ownerId,
@@ -319,27 +322,27 @@ export class ToolCallHandler {
           sessionId: this.sessionId,
           turnId,
           coordinationRunId: workId,
+          coordinationRequestId: requestId,
           signal,
           onEvent: event => this.forwardCoordinatorEvent(event, onEvent),
         })
       },
       canceler: async ({ previousStatus, abort }) => {
-        if (previousStatus === 'delegated') {
-          const result = await this.coordinator.cancelDelegatedWork(
-            workId,
-            { ownerId: this.ownerId },
-          )
-          abort()
-          return result
-        }
+        const result = await this.coordinator.cancelWork(
+          workId,
+          { ownerId: this.ownerId },
+        )
         abort()
         return {
-          route: 'adapter',
-          layer: previousStatus === 'finalizing' ? 'finalizing' : 'coordinator',
+          ...result,
+          layer: previousStatus === 'finalizing'
+            ? 'finalizing'
+            : result?.layer || 'coordinator',
         }
       },
     })
     workId = task.id
+    requestId = task.jobId
     return task
   }
 
@@ -379,6 +382,7 @@ export class ToolCallHandler {
           sessionId: context.sessionId,
           turnId: context.turnId,
           coordinationRunId: context.taskId,
+          coordinationRequestId: context.jobId,
           signal: context.signal,
           onEvent: context.onEvent,
         })
@@ -549,6 +553,7 @@ export class ToolCallHandler {
           )
         }
       }
+      this.onAgentActivity({ activity: 'query', turnId })
       await this.getAgentTaskStatus(callId, turnId, args)
       return
     }
