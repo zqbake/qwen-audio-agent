@@ -3,31 +3,36 @@ import XCTest
 @testable import QwenInputCore
 
 final class InputMethodLifecycleTests: XCTestCase {
-    func testInstallValidatesThenAtomicallyInstallsAndRegistersWithoutEnabling() throws {
+    func testInstallRegistersEnablesSelectsVerifiesThenCommitsHiddenPalette() throws {
         let fileSystem = FakeInputMethodFileSystem()
         let registration = FakeInputMethodRegistration()
         let embedded = URL(fileURLWithPath: "/Applications/Qwen.app/Contents/Resources/native-input/Qwen Input.app")
         let installed = URL(fileURLWithPath: "/Users/test/Library/Input Methods/Qwen Input.app")
         fileSystem.inspections[embedded.path] = .valid(owner: 501)
 
-        let lifecycle = makeLifecycle(
+        let status = try makeLifecycle(
             fileSystem: fileSystem,
             registration: registration,
             embedded: embedded,
             installed: installed
-        )
-        let status = try lifecycle.install()
+        ).install()
 
         XCTAssertEqual(fileSystem.installCalls, [[embedded.path, installed.path]])
         XCTAssertEqual(fileSystem.commitCalls, [installed.path])
-        XCTAssertEqual(registration.calls, ["register:\(installed.path)"])
-        XCTAssertTrue(status.installed)
-        XCTAssertTrue(status.registered)
-        XCTAssertFalse(status.enabled)
-        XCTAssertEqual(status.version, "1.11.0")
+        XCTAssertEqual(registration.calls, [
+            "contains", "register:\(installed.path)", "enable", "select",
+            "contains", "enabled", "selected",
+        ])
+        XCTAssertEqual(status, InputMethodLifecycleStatus(
+            installed: true,
+            registered: true,
+            enabled: true,
+            selected: true,
+            version: "1.11.0"
+        ))
     }
 
-    func testInstallRejectsSymlinkWrongOwnerSignatureAndVersionBeforeMutation() {
+    func testInstallRejectsUnsafeEmbeddedBundleBeforeMutation() {
         let invalid: [InputMethodArtifactInspection] = [
             .valid(owner: 0, symbolicLink: true),
             .valid(owner: 501, signatureValid: false),
@@ -40,9 +45,7 @@ final class InputMethodLifecycleTests: XCTestCase {
             fileSystem.inspections["/embedded/Qwen Input.app"] = inspection
             let lifecycle = makeLifecycle(
                 fileSystem: fileSystem,
-                registration: registration,
-                embedded: URL(fileURLWithPath: "/embedded/Qwen Input.app"),
-                installed: URL(fileURLWithPath: "/installed/Qwen Input.app")
+                registration: registration
             )
             XCTAssertThrowsError(try lifecycle.install())
             XCTAssertTrue(fileSystem.installCalls.isEmpty)
@@ -50,66 +53,98 @@ final class InputMethodLifecycleTests: XCTestCase {
         }
     }
 
-    func testRegistrationFailureRollsBackAtomicReplacement() {
+    func testEnableSelectAndVerificationFailuresRollbackNewPalette() {
+        let cases: [(FakeInputMethodRegistration) -> Void] = [
+            { $0.registerResult = false },
+            { $0.enableResult = false },
+            { $0.selectResult = false },
+            { $0.selectSetsSelected = false },
+        ]
+        for configure in cases {
+            let fileSystem = FakeInputMethodFileSystem()
+            let registration = FakeInputMethodRegistration()
+            fileSystem.inspections["/embedded/Qwen Input.app"] = .valid(owner: 501)
+            configure(registration)
+
+            XCTAssertThrowsError(try makeLifecycle(
+                fileSystem: fileSystem,
+                registration: registration
+            ).install())
+            XCTAssertEqual(fileSystem.rollbackCalls, ["/installed/Qwen Input.app"])
+            XCTAssertTrue(fileSystem.commitCalls.isEmpty)
+            XCTAssertEqual(registration.calls.last, "disable")
+        }
+    }
+
+    func testUpgradeFailureRollsBackBundleAndRestoresPreviousQwenPalette() {
         let fileSystem = FakeInputMethodFileSystem()
         let registration = FakeInputMethodRegistration()
-        let embedded = URL(fileURLWithPath: "/embedded/Qwen Input.app")
-        let installed = URL(fileURLWithPath: "/installed/Qwen Input.app")
-        fileSystem.inspections[embedded.path] = .valid(owner: 501)
-        registration.registerResult = false
-        let lifecycle = makeLifecycle(
-            fileSystem: fileSystem,
-            registration: registration,
-            embedded: embedded,
-            installed: installed
-        )
+        fileSystem.inspections["/embedded/Qwen Input.app"] = .valid(owner: 501)
+        fileSystem.inspections["/installed/Qwen Input.app"] = .valid(owner: 501)
+        registration.contains = true
+        registration.enabled = true
+        registration.selected = true
+        registration.selectResult = false
 
-        XCTAssertThrowsError(try lifecycle.install())
-        XCTAssertEqual(fileSystem.rollbackCalls, [installed.path])
+        XCTAssertThrowsError(try makeLifecycle(
+            fileSystem: fileSystem,
+            registration: registration
+        ).install())
+
+        XCTAssertEqual(fileSystem.rollbackCalls, ["/installed/Qwen Input.app"])
+        XCTAssertEqual(Array(registration.calls.suffix(4)), [
+            "register:/installed/Qwen Input.app", "enable", "select", "disable",
+        ])
         XCTAssertTrue(fileSystem.commitCalls.isEmpty)
     }
 
-    func testStatusFailsClosedForUnsafeInstalledBundle() throws {
+    func testStatusFailsClosedForUnsafeBundleAndReportsSelectedReadiness() throws {
         let fileSystem = FakeInputMethodFileSystem()
         let registration = FakeInputMethodRegistration()
-        let installed = URL(fileURLWithPath: "/installed/Qwen Input.app")
-        fileSystem.inspections[installed.path] = .valid(
+        fileSystem.inspections["/installed/Qwen Input.app"] = .valid(
             owner: 999,
             symbolicLink: true
         )
         registration.contains = true
         registration.enabled = true
-        let lifecycle = makeLifecycle(
-            fileSystem: fileSystem,
-            registration: registration,
-            installed: installed
-        )
+        registration.selected = true
 
-        let status = try lifecycle.status()
-        XCTAssertFalse(status.installed)
-        XCTAssertFalse(status.registered)
-        XCTAssertFalse(status.enabled)
+        let status = try makeLifecycle(
+            fileSystem: fileSystem,
+            registration: registration
+        ).status()
+        XCTAssertEqual(status, InputMethodLifecycleStatus(
+            installed: false,
+            registered: false,
+            enabled: false,
+            selected: false,
+            version: ""
+        ))
+        XCTAssertTrue(registration.calls.isEmpty)
     }
 
-    func testUninstallDisablesBeforeMovingBundleToTrash() throws {
+    func testUninstallDisablesOnlyQwenPaletteBeforeMovingBundleToTrash() throws {
         let fileSystem = FakeInputMethodFileSystem()
         let registration = FakeInputMethodRegistration()
-        let installed = URL(fileURLWithPath: "/installed/Qwen Input.app")
-        fileSystem.inspections[installed.path] = .valid(owner: 501)
+        fileSystem.inspections["/installed/Qwen Input.app"] = .valid(owner: 501)
         registration.contains = true
         registration.enabled = true
-        let lifecycle = makeLifecycle(
-            fileSystem: fileSystem,
-            registration: registration,
-            installed: installed
-        )
+        registration.selected = true
 
-        let status = try lifecycle.uninstall()
-        XCTAssertEqual(registration.calls, ["disable"])
-        XCTAssertEqual(fileSystem.trashCalls, [installed.path])
-        XCTAssertFalse(status.installed)
-        XCTAssertFalse(status.registered)
-        XCTAssertFalse(status.enabled)
+        let status = try makeLifecycle(
+            fileSystem: fileSystem,
+            registration: registration
+        ).uninstall()
+
+        XCTAssertEqual(registration.calls, ["contains", "disable"])
+        XCTAssertEqual(fileSystem.trashCalls, ["/installed/Qwen Input.app"])
+        XCTAssertEqual(status, InputMethodLifecycleStatus(
+            installed: false,
+            registered: false,
+            enabled: false,
+            selected: false,
+            version: ""
+        ))
     }
 
     private func makeLifecycle(
@@ -148,7 +183,6 @@ private final class FakeInputMethodFileSystem: InputMethodLifecycleFileSystem {
 
     func rollbackInstall(at destination: URL) throws {
         rollbackCalls.append(destination.path)
-        inspections[destination.path] = nil
     }
 
     func commitInstall(at destination: URL) throws {
@@ -164,20 +198,48 @@ private final class FakeInputMethodFileSystem: InputMethodLifecycleFileSystem {
 private final class FakeInputMethodRegistration: InputMethodRegistration {
     var contains = false
     var enabled = false
+    var selected = false
     var registerResult = true
+    var enableResult = true
+    var selectResult = true
+    var selectSetsSelected = true
     var disableResult = true
     var calls: [String] = []
 
-    func containsInputSource() -> Bool { contains }
-    func isInputSourceEnabled() -> Bool { enabled }
+    func containsInputSource() -> Bool {
+        calls.append("contains")
+        return contains
+    }
+    func isInputSourceEnabled() -> Bool {
+        calls.append("enabled")
+        return enabled
+    }
+    func isInputSourceSelected() -> Bool {
+        calls.append("selected")
+        return selected
+    }
     func registerInputSource(at url: URL) -> Bool {
         calls.append("register:\(url.path)")
         if registerResult { contains = true }
         return registerResult
     }
+    func enableInputSource() -> Bool {
+        calls.append("enable")
+        if enableResult { enabled = true }
+        return enableResult
+    }
+    func selectInputSource() -> Bool {
+        calls.append("select")
+        if selectResult, selectSetsSelected { selected = true }
+        return selectResult
+    }
     func disableInputSource() -> Bool {
         calls.append("disable")
-        if disableResult { enabled = false; contains = false }
+        if disableResult {
+            enabled = false
+            selected = false
+            contains = false
+        }
         return disableResult
     }
 }

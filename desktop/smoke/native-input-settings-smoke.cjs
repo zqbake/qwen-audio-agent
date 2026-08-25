@@ -5,9 +5,10 @@ const root = resolve(__dirname, '../..')
 const lifecycle = {
   installed: true,
   registered: true,
-  enabled: false,
+  enabled: true,
+  selected: false,
   version: '1.11.0',
-  state: 'needs-enable',
+  state: 'needs-repair',
 }
 const runtime = {
   gatewayConnected: false,
@@ -17,7 +18,6 @@ const runtime = {
   voiceConfigured: false,
 }
 let lifecycleStatusCalls = 0
-let openSettingsRequests = 0
 
 app.commandLine.appendSwitch('lang', 'en-US')
 
@@ -66,10 +66,6 @@ app.whenReady().then(async () => {
     lifecycleStatusCalls += 1
     return { ...lifecycle }
   })
-  ipcMain.on('qwen-audio-agent:native-input-open-settings', () => {
-    openSettingsRequests += 1
-  })
-
   const window = new BrowserWindow({
     width: 600,
     height: 800,
@@ -85,12 +81,13 @@ app.whenReady().then(async () => {
   const readNativeInputControls = () => window.webContents.executeJavaScript(`({
     language: document.documentElement.lang,
     status: document.querySelector('#native-input-status')?.textContent,
-    buttonText: document.querySelector('#native-input-system-settings')?.textContent,
-    buttonVisible: !document.querySelector('#native-input-system-settings')?.hidden,
+    manualSettingsButtonPresent: Boolean(
+      document.querySelector('#native-input-system-settings')
+    ),
   })`)
   const initial = await waitFor(async () => {
     const value = await readNativeInputControls()
-    return value.status === 'Installed. Enable Qwen Input in System Settings.'
+    return value.status === 'Installation needs repair'
       ? value
       : null
   }, 5_000, async () => JSON.stringify({
@@ -98,13 +95,8 @@ app.whenReady().then(async () => {
     lifecycleStatusCalls,
   }))
 
-  await window.webContents.executeJavaScript(
-    "document.querySelector('#native-input-system-settings').click()",
-  )
-  await waitFor(() => openSettingsRequests === 1)
-
   const callsBeforeFocus = lifecycleStatusCalls
-  Object.assign(lifecycle, { enabled: true, state: 'ready' })
+  Object.assign(lifecycle, { selected: true, state: 'ready' })
   await window.webContents.executeJavaScript(
     "window.dispatchEvent(new Event('focus'))",
   )
@@ -112,14 +104,13 @@ app.whenReady().then(async () => {
     const text = await window.webContents.executeJavaScript(
       "document.querySelector('#native-input-status')?.textContent",
     )
-    return text === 'Installed and enabled. Select Qwen Input from the input menu.'
+    return text === 'Hidden input component installed and ready.'
       ? text
       : null
   })
 
   process.stdout.write(`NATIVE_INPUT_SETTINGS_PROBE:${JSON.stringify({
     ...initial,
-    openSettingsRequests,
     callsBeforeFocus,
     callsAfterFocus: lifecycleStatusCalls,
     refreshedStatus,

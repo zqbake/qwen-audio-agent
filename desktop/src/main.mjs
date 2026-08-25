@@ -910,7 +910,7 @@ ipcMain.handle('qwen-audio-agent:native-input-lifecycle', async (event, value) =
       title: desktopText('管理 Qwen Input'),
       message: action === 'uninstall'
         ? desktopText('将停用并移除当前用户的 Qwen Input。')
-        : desktopText('将为当前用户安装并注册 Qwen Input；系统不会自动启用或切换输入法。'),
+        : desktopText('将为当前用户安装、启用并选择隐藏的 Qwen 输入组件；普通键盘输入源不会改变。'),
     })
     if (response !== 0) return { cancelled: true }
   }
@@ -922,13 +922,6 @@ ipcMain.handle('qwen-audio-agent:native-input-lifecycle', async (event, value) =
   } finally {
     if (startedTemporarily) await nativeInputHost.stop('lifecycle_complete')
   }
-})
-
-ipcMain.on('qwen-audio-agent:native-input-open-settings', event => {
-  if (!settingsWindow || event.sender !== settingsWindow.webContents) return
-  void shell.openExternal(
-    'x-apple.systempreferences:com.apple.Keyboard-Settings.extension',
-  )
 })
 
 ipcMain.on('qwen-audio-agent:native-input-open-accessibility-settings', event => {

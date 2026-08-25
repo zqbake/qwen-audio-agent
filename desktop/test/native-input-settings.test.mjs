@@ -51,28 +51,24 @@ async function runSettingsProbe() {
 
 const probe = process.platform === 'darwin' ? await runSettingsProbe() : null
 
-test('needs-enable offers an explicit input source settings action', {
+test('incomplete hidden palette offers repair without manual input-source settings', {
   skip: process.platform !== 'darwin',
 }, () => {
   assert.deepEqual({
     status: probe.status,
-    buttonText: probe.buttonText,
-    buttonVisible: probe.buttonVisible,
-    openSettingsRequests: probe.openSettingsRequests,
+    manualSettingsButtonPresent: probe.manualSettingsButtonPresent,
   }, {
-    status: 'Installed. Enable Qwen Input in System Settings.',
-    buttonText: 'Open Input Source Settings',
-    buttonVisible: true,
-    openSettingsRequests: 1,
+    status: 'Installation needs repair',
+    manualSettingsButtonPresent: false,
   })
 })
 
-test('returning from input source settings refreshes lifecycle state', {
+test('returning to settings refreshes hidden palette lifecycle state', {
   skip: process.platform !== 'darwin',
 }, () => {
   assert.ok(probe.callsAfterFocus > probe.callsBeforeFocus)
   assert.equal(
     probe.refreshedStatus,
-    'Installed and enabled. Select Qwen Input from the input menu.',
+    'Hidden input component installed and ready.',
   )
 })

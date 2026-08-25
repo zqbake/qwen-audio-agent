@@ -30,6 +30,7 @@ public enum NativeInputMessageType: String, Codable, CaseIterable, Sendable {
 public struct NativeInputMessage: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case type, text, state, reason, action, installed, registered, enabled
+        case selected
         case version, accepted, revision, generation, operation, target
         case replacement, statusVisible, accessibilityEnabled
         case requestID = "requestId"
@@ -47,6 +48,7 @@ public struct NativeInputMessage: Codable, Equatable, Sendable {
     public let installed: Bool?
     public let registered: Bool?
     public let enabled: Bool?
+    public let selected: Bool?
     public let version: String?
     public let operationID: String?
     public let accepted: Bool?
@@ -71,6 +73,7 @@ public struct NativeInputMessage: Codable, Equatable, Sendable {
         installed: Bool? = nil,
         registered: Bool? = nil,
         enabled: Bool? = nil,
+        selected: Bool? = nil,
         version: String? = nil,
         operationID: String? = nil,
         accepted: Bool? = nil,
@@ -94,6 +97,7 @@ public struct NativeInputMessage: Codable, Equatable, Sendable {
         self.installed = installed
         self.registered = registered
         self.enabled = enabled
+        self.selected = selected
         self.version = version
         self.operationID = operationID
         self.accepted = accepted

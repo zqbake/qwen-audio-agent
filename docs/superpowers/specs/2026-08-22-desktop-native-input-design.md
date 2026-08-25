@@ -128,7 +128,7 @@ Electron main
     v
 QwenInputBridge (embedded Desktop executable)
   - install/status/uninstall plan
-  - TIS select/restore
+  - install-time public TIS register/enable/select/verify for hidden palette
   - authenticated Unix-domain listener in a 0700 runtime directory
     |
     | framed local socket; same euid + exact dynamic code requirement
@@ -171,10 +171,10 @@ arbitrary native command or file path crosses preload.
 The Bridge is a universal Swift executable embedded in Desktop. It never
 captures audio, connects to the Gateway, holds provider credentials, or writes
 user text. It validates and atomically installs the version-matched input
-bundle, queries registration/enablement, validates that Qwen Input is already
-user-selected for a session, publishes a transient Unix-domain socket, and
-reports typed lifecycle events. Production does not silently select or restore
-an input source.
+bundle, registers/enables/selects and verifies the hidden Qwen palette after an
+explicit install/repair confirmation, publishes a transient Unix-domain
+socket, and reports typed lifecycle events. Active sessions only read palette
+readiness; they never select or restore an ordinary keyboard input source.
 
 Electron main communicates with the Bridge over inherited stdin/stdout. The
 Bridge creates `control.sock` under a Desktop-owned 0700 runtime directory and
@@ -187,7 +187,8 @@ PID alone is never accepted as identity.
 
 ### Qwen Input
 
-Qwen Input is a palette-style InputMethodKit bundle without a user-facing app.
+Qwen Input is a `ComponentInvisibleInSystemUI` palette-style InputMethodKit
+bundle without a user-facing app or ordinary input-menu item.
 It manages one ledger per active `IMKInputController`. It accepts only
 authenticated operations for the currently locked target and writes only text
 created by that native dictation session.
@@ -199,7 +200,7 @@ or remove the owned partial before the session pauses.
 
 The native spike is a release gate for palette behavior: Qwen Input must not
 swallow physical keys when idle, and target applications must retain ordinary
-typing before, during, and after source restoration. Failure rejects this
+typing while the hidden palette coexists with the unchanged keyboard source. Failure rejects this
 architecture before Gateway integration.
 
 ## Session and target model

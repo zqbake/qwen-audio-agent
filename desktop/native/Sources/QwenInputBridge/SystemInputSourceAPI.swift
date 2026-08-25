@@ -20,8 +20,26 @@ final class SystemInputSourceAPI: InputSourceAPI, InputMethodRegistration {
         isInputSourceEnabled(id: qwenInputSourceID)
     }
 
+    func isInputSourceSelected() -> Bool {
+        isInputSourceSelected(id: qwenInputSourceID)
+    }
+
     func registerInputSource(at url: URL) -> Bool {
         TISRegisterInputSource(url as CFURL) == noErr
+    }
+
+    func enableInputSource() -> Bool {
+        guard let source = inputSource(id: qwenInputSourceID) else {
+            return false
+        }
+        return TISEnableInputSource(source) == noErr
+    }
+
+    func selectInputSource() -> Bool {
+        guard let source = inputSource(id: qwenInputSourceID) else {
+            return false
+        }
+        return TISSelectInputSource(source) == noErr
     }
 
     func disableInputSource() -> Bool {
@@ -30,22 +48,23 @@ final class SystemInputSourceAPI: InputSourceAPI, InputMethodRegistration {
         }
         return TISDisableInputSource(source) == noErr
     }
-    func currentKeyboardSourceID() -> String? {
-        guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else {
-            return nil
-        }
-        return stringProperty(source, key: kTISPropertyInputSourceID)
-    }
-
     func containsInputSource(id: String) -> Bool {
         inputSource(id: id) != nil
     }
 
     func isInputSourceEnabled(id: String) -> Bool {
+        boolProperty(id: id, key: kTISPropertyInputSourceIsEnabled)
+    }
+
+    func isInputSourceSelected(id: String) -> Bool {
+        boolProperty(id: id, key: kTISPropertyInputSourceIsSelected)
+    }
+
+    private func boolProperty(id: String, key: CFString?) -> Bool {
         guard let source = inputSource(id: id),
               let pointer = TISGetInputSourceProperty(
                   source,
-                  kTISPropertyInputSourceIsEnabled
+                  key
               )
         else {
             return false
@@ -55,13 +74,6 @@ final class SystemInputSourceAPI: InputSourceAPI, InputMethodRegistration {
             .fromOpaque(pointer)
             .takeUnretainedValue()
         return CFBooleanGetValue(value)
-    }
-
-    func selectInputSource(id: String) -> Bool {
-        guard let source = inputSource(id: id) else {
-            return false
-        }
-        return TISSelectInputSource(source) == noErr
     }
 
     private func inputSource(id: String) -> TISInputSource? {
@@ -81,15 +93,4 @@ final class SystemInputSourceAPI: InputSourceAPI, InputMethodRegistration {
         return unsafeBitCast(value as AnyObject, to: TISInputSource.self)
     }
 
-    private func stringProperty(
-        _ source: TISInputSource,
-        key: CFString?
-    ) -> String? {
-        guard let pointer = TISGetInputSourceProperty(source, key) else {
-            return nil
-        }
-        return Unmanaged<CFString>
-            .fromOpaque(pointer)
-            .takeUnretainedValue() as String
-    }
 }

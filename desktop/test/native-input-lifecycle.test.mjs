@@ -20,7 +20,9 @@ class FakeHost extends EventEmitter {
       action: message.type.slice('lifecycle.'.length),
       installed: message.type !== 'lifecycle.uninstall',
       registered: message.type !== 'lifecycle.uninstall',
-      enabled: false,
+      enabled: message.type !== 'lifecycle.uninstall',
+      selected: message.type === 'lifecycle.install'
+        || message.type === 'lifecycle.repair',
       version: message.type === 'lifecycle.uninstall' ? '' : '1.11.0',
     })
   }
@@ -33,12 +35,13 @@ test('lifecycle exposes correlated status/install/repair/uninstall operations', 
   assert.deepEqual(await lifecycle.status(), {
     installed: true,
     registered: true,
-    enabled: false,
+    enabled: true,
+    selected: false,
     version: '1.11.0',
-    state: 'needs-enable',
+    state: 'needs-repair',
   })
-  assert.equal((await lifecycle.install()).state, 'needs-enable')
-  assert.equal((await lifecycle.repair()).state, 'needs-enable')
+  assert.equal((await lifecycle.install()).state, 'ready')
+  assert.equal((await lifecycle.repair()).state, 'ready')
   assert.equal((await lifecycle.uninstall()).state, 'not-installed')
   assert.deepEqual(host.requests.map(message => message.type), [
     'lifecycle.status',
@@ -58,6 +61,7 @@ test('lifecycle fails closed on malformed or mismatched Bridge results', async (
       installed: true,
       registered: true,
       enabled: true,
+      selected: true,
       version: '1.11.0',
     }),
   }

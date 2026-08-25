@@ -141,11 +141,8 @@ do {
 
 #if DEBUG
 private final class ProbeInputSourceAPI: InputSourceAPI {
-    private var current = "ai.qwenaudio.agent.inputmethod"
-    func currentKeyboardSourceID() -> String? { current }
     func containsInputSource(id: String) -> Bool { true }
     func isInputSourceEnabled(id: String) -> Bool { true }
-    func selectInputSource(id: String) -> Bool { current = id; return true }
-    func registerInputSource(at url: URL) -> Bool { true }
+    func isInputSourceSelected(id: String) -> Bool { true }
 }
 #endif

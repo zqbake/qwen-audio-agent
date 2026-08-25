@@ -76,6 +76,7 @@ test('accepts lifecycle and correlated native operation message types', () => {
       installed: false,
       registered: false,
       enabled: false,
+      selected: false,
       version: '',
     },
     {

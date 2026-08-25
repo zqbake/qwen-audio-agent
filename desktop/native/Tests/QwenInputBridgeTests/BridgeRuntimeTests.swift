@@ -34,8 +34,7 @@ final class BridgeRuntimeTests: XCTestCase {
         }
 
         XCTAssertThrowsError(try runtime.run())
-        XCTAssertEqual(source.current, "ai.qwenaudio.agent.inputmethod")
-        XCTAssertTrue(source.selections.isEmpty)
+        XCTAssertEqual(source.calls, ["contains", "enabled", "selected"])
     }
 
     func testRepairIsRejectedWithoutMutationWhileSessionIsArmed() throws {
@@ -82,23 +81,25 @@ final class BridgeRuntimeTests: XCTestCase {
 
         try runtime.run()
         XCTAssertTrue(fileSystem.installCalls.isEmpty)
-        XCTAssertEqual(source.current, "ai.qwenaudio.agent.inputmethod")
+        XCTAssertEqual(source.calls, ["contains", "enabled", "selected"])
     }
 }
 
 private final class FakeInputSourceAPI: InputSourceAPI, @unchecked Sendable {
-    var current = "ai.qwenaudio.agent.inputmethod"
-    var selections: [String] = []
+    var calls: [String] = []
 
-    func currentKeyboardSourceID() -> String? { current }
-    func containsInputSource(id: String) -> Bool { true }
-    func isInputSourceEnabled(id: String) -> Bool { true }
-    func selectInputSource(id: String) -> Bool {
-        selections.append(id)
-        current = id
+    func containsInputSource(id: String) -> Bool {
+        calls.append("contains")
         return true
     }
-    func registerInputSource(at url: URL) -> Bool { true }
+    func isInputSourceEnabled(id: String) -> Bool {
+        calls.append("enabled")
+        return true
+    }
+    func isInputSourceSelected(id: String) -> Bool {
+        calls.append("selected")
+        return true
+    }
 }
 
 private final class FakeLifecycleFileSystem: InputMethodLifecycleFileSystem {
@@ -124,6 +125,9 @@ private final class FakeLifecycleFileSystem: InputMethodLifecycleFileSystem {
 private final class FakeLifecycleRegistration: InputMethodRegistration {
     func containsInputSource() -> Bool { true }
     func isInputSourceEnabled() -> Bool { true }
+    func isInputSourceSelected() -> Bool { true }
     func registerInputSource(at url: URL) -> Bool { true }
+    func enableInputSource() -> Bool { true }
+    func selectInputSource() -> Bool { true }
     func disableInputSource() -> Bool { true }
 }

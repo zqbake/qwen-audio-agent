@@ -932,22 +932,22 @@ Both are application-local.
 Desktop-owned InputMethodKit input is independently disabled by default and
 also requires composer dictation to be configured. It remains unavailable
 until the version-matched Qwen Input bundle is installed, registered, enabled
-in System Settings, and explicitly selected from the macOS input menu.
+and selected as a hidden palette by the explicit Install or Repair action.
+The palette coexists with the current keyboard source, so ABC, Pinyin, and
+other ordinary keyboard layouts are neither selected nor restored per session.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QWEN_AUDIO_NATIVE_INPUT_ENABLED` | empty / off | Enable the Desktop-owned native input host after installation |
 | `QWEN_AUDIO_NATIVE_INPUT_SHORTCUT` | `CommandOrControl+Shift+D` | Desktop global shortcut |
 
-Settings exposes read-only status plus explicit Install, Repair, Uninstall,
-and System Settings actions. Install/repair verifies path, owner, bundle ID,
-version, and code signature, then atomically replaces and registers the bundle;
-it never silently enables or selects it. The base path uses the existing
+Settings exposes read-only status plus explicit Install, Repair, and Uninstall
+actions. After user confirmation, install/repair verifies path, owner, bundle
+ID, version, and code signature, atomically replaces the bundle, then uses the
+public TIS API to register, enable, select, and verify only the hidden Qwen
+palette. Failure rolls back the bundle and Qwen palette state. The base path uses the existing
 Desktop microphone permission and does not request Accessibility, Input
 Monitoring, Full Disk Access, administrator credentials, or a second provider
 credential. See `docs/desktop/native-input-testing.md` before changing input
-source or TCC state.
-
-Keep Qwen Input selected while using the global shortcut; ordinary physical
-typing still passes through. Starting from another input source fails visibly
-without changing the user's selection.
+source or TCC state. Sessions only read the hidden palette's readiness and fail
+visibly if it is unavailable; they never switch or restore a keyboard source.

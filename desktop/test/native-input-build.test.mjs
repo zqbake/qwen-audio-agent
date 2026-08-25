@@ -25,6 +25,7 @@ test('native build stays permission-minimal and part of the Desktop release', ()
   )
   assert.match(project, /QwenInputBridge:/)
   assert.match(project, /QwenInput:/)
+  assert.match(project, /ComponentInvisibleInSystemUI:\s*true/)
   assert.match(project, /CREATE_INFOPLIST_SECTION_IN_BINARY: YES/)
   assert.doesNotMatch(
     project,
@@ -78,6 +79,12 @@ test('builds an inert current-architecture Bridge and InputMethodKit bundle', {
     ])
     assert.equal(inputType.status, 0, inputType.stderr)
     assert.equal(inputType.stdout.trim(), 'Palette')
+
+    const invisible = run('plutil', [
+      '-extract', 'ComponentInvisibleInSystemUI', 'raw', '-o', '-', inputMethodInfo,
+    ])
+    assert.equal(invisible.status, 0, invisible.stderr)
+    assert.equal(invisible.stdout.trim(), 'true')
 
     const bridgeArchitectures = run('lipo', ['-archs', bridge])
     assert.equal(bridgeArchitectures.status, 0, bridgeArchitectures.stderr)

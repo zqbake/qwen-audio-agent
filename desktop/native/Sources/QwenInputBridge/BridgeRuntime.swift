@@ -121,14 +121,8 @@ final class BridgeRuntime {
         if request.type == .sessionArm {
             let source = inputSourceCoordinator.begin()
             switch source {
-            case .selected, .alreadySelected:
+            case .ready:
                 break
-            case .selectionRequired:
-                return operationResult(
-                    request,
-                    accepted: false,
-                    reason: "input_source_selection_required"
-                )
             default:
                 return operationResult(
                     request,
@@ -137,7 +131,6 @@ final class BridgeRuntime {
                 )
             }
             guard let target = broker.waitForTarget(timeout: 2.0) else {
-                _ = inputSourceCoordinator.restore()
                 return operationResult(
                     request,
                     accepted: false,
@@ -159,7 +152,6 @@ final class BridgeRuntime {
         if request.type == .sessionCancel {
             let result = broker.submitAndWait(request, timeout: 2.0)
             broker.cancel(reason: request.reason ?? "cancelled")
-            _ = inputSourceCoordinator.restore()
             return operationResult(
                 request,
                 accepted: result.accepted,
@@ -169,7 +161,6 @@ final class BridgeRuntime {
         let result = broker.submitAndWait(request, timeout: 2.0)
         if !result.accepted {
             broker.cancel(reason: result.reason ?? "operation_failed")
-            _ = inputSourceCoordinator.restore()
         }
         return operationResult(
             request,
@@ -196,7 +187,6 @@ final class BridgeRuntime {
 
     func emergencyStop(reason: String) {
         broker.cancel(reason: reason)
-        _ = inputSourceCoordinator.restore()
     }
 
     private func lifecycleResponse(
@@ -242,6 +232,7 @@ final class BridgeRuntime {
             installed: status.installed,
             registered: status.registered,
             enabled: status.enabled,
+            selected: status.selected,
             version: status.version,
             accepted: true
         )

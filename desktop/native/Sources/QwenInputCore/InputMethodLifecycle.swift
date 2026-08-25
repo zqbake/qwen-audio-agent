@@ -26,17 +26,20 @@ public struct InputMethodLifecycleStatus: Equatable, Sendable {
     public let installed: Bool
     public let registered: Bool
     public let enabled: Bool
+    public let selected: Bool
     public let version: String
 
     public init(
         installed: Bool,
         registered: Bool,
         enabled: Bool,
+        selected: Bool,
         version: String
     ) {
         self.installed = installed
         self.registered = registered
         self.enabled = enabled
+        self.selected = selected
         self.version = version
     }
 }
@@ -45,6 +48,9 @@ public enum InputMethodLifecycleError: Error, Equatable, Sendable {
     case embeddedBundleMissing
     case unsafeEmbeddedBundle
     case registrationFailed
+    case enableFailed
+    case selectionFailed
+    case verificationFailed
     case disableFailed
 }
 
@@ -59,7 +65,10 @@ public protocol InputMethodLifecycleFileSystem: AnyObject {
 public protocol InputMethodRegistration: AnyObject {
     func containsInputSource() -> Bool
     func isInputSourceEnabled() -> Bool
+    func isInputSourceSelected() -> Bool
     func registerInputSource(at url: URL) -> Bool
+    func enableInputSource() -> Bool
+    func selectInputSource() -> Bool
     func disableInputSource() -> Bool
 }
 
@@ -97,14 +106,17 @@ public final class InputMethodLifecycle {
                 installed: false,
                 registered: false,
                 enabled: false,
+                selected: false,
                 version: ""
             )
         }
         let registered = registration.containsInputSource()
+        let enabled = registered && registration.isInputSourceEnabled()
         return InputMethodLifecycleStatus(
             installed: true,
             registered: registered,
-            enabled: registered && registration.isInputSourceEnabled(),
+            enabled: enabled,
+            selected: enabled && registration.isInputSourceSelected(),
             version: inspection.version
         )
     }
@@ -116,16 +128,38 @@ public final class InputMethodLifecycle {
         guard valid(embedded, installed: false) else {
             throw InputMethodLifecycleError.unsafeEmbeddedBundle
         }
+        let previousInstalled = fileSystem.inspect(at: installedBundleURL) != nil
+        let previousRegistered = registration.containsInputSource()
         try fileSystem.installAtomically(
             from: embeddedBundleURL,
             to: installedBundleURL
         )
-        guard registration.registerInputSource(at: installedBundleURL) else {
+        do {
+            guard registration.registerInputSource(at: installedBundleURL) else {
+                throw InputMethodLifecycleError.registrationFailed
+            }
+            guard registration.enableInputSource() else {
+                throw InputMethodLifecycleError.enableFailed
+            }
+            guard registration.selectInputSource() else {
+                throw InputMethodLifecycleError.selectionFailed
+            }
+            let installedStatus = try status()
+            guard installedStatus.registered,
+                  installedStatus.enabled,
+                  installedStatus.selected else {
+                throw InputMethodLifecycleError.verificationFailed
+            }
+            try fileSystem.commitInstall(at: installedBundleURL)
+            return installedStatus
+        } catch {
             try? fileSystem.rollbackInstall(at: installedBundleURL)
-            throw InputMethodLifecycleError.registrationFailed
+            restorePreviousPaletteIfPossible(
+                previousInstalled: previousInstalled,
+                previousRegistered: previousRegistered
+            )
+            throw error
         }
-        try fileSystem.commitInstall(at: installedBundleURL)
-        return try status()
     }
 
     public func repair() throws -> InputMethodLifecycleStatus {
@@ -144,6 +178,7 @@ public final class InputMethodLifecycle {
             installed: false,
             registered: false,
             enabled: false,
+            selected: false,
             version: ""
         )
     }
@@ -159,5 +194,19 @@ public final class InputMethodLifecycle {
         return installed
             ? inspection.ownerUserID == currentUserID
             : inspection.ownerUserID == currentUserID || inspection.ownerUserID == 0
+    }
+
+    private func restorePreviousPaletteIfPossible(
+        previousInstalled: Bool,
+        previousRegistered: Bool
+    ) {
+        if previousInstalled,
+           previousRegistered,
+           registration.registerInputSource(at: installedBundleURL),
+           registration.enableInputSource(),
+           registration.selectInputSource() {
+            return
+        }
+        _ = registration.disableInputSource()
     }
 }

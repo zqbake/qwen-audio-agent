@@ -46,9 +46,6 @@ const nativeInputStatus = document.querySelector('#native-input-status')
 const nativeInputInstall = document.querySelector('#native-input-install')
 const nativeInputRepair = document.querySelector('#native-input-repair')
 const nativeInputUninstall = document.querySelector('#native-input-uninstall')
-const nativeInputSystemSettings = document.querySelector(
-  '#native-input-system-settings',
-)
 const dashscopeApiKey = document.querySelector('#dashscope-api-key')
 const realtimeBaseUrl = document.querySelector('#realtime-base-url')
 const realtimeVoice = document.querySelector('#realtime-voice')
@@ -1151,19 +1148,18 @@ for (const control of [
 
 function renderNativeInputLifecycle(status) {
   const labels = {
-    ready: t('已安装并启用；请从输入菜单选择 Qwen Input'),
-    'needs-enable': t('已安装，请在系统设置中启用 Qwen Input'),
+    ready: t('隐藏输入组件已安装并就绪'),
+    'needs-enable': t('安装不完整，需要修复'),
     'needs-repair': t('安装不完整，需要修复'),
     'not-installed': t('尚未安装'),
     error: t('输入法状态不可用'),
   }
   nativeInputStatus.textContent = labels[status?.state] || t('正在检查输入法…')
   nativeInputInstall.hidden = status?.state !== 'not-installed'
-  nativeInputRepair.hidden = !['needs-repair', 'error'].includes(status?.state)
-  nativeInputUninstall.hidden = status?.installed !== true
-  nativeInputSystemSettings.hidden = ![
-    'needs-enable', 'ready',
+  nativeInputRepair.hidden = ![
+    'needs-repair', 'needs-enable', 'error',
   ].includes(status?.state)
+  nativeInputUninstall.hidden = status?.installed !== true
 }
 
 async function runNativeInputLifecycle(action) {
@@ -1171,7 +1167,6 @@ async function runNativeInputLifecycle(action) {
     nativeInputInstall,
     nativeInputRepair,
     nativeInputUninstall,
-    nativeInputSystemSettings,
   ]) button.disabled = true
   try {
     const status = await window.qwenAudioAgentDesktop.nativeInputLifecycle(action)
@@ -1184,7 +1179,6 @@ async function runNativeInputLifecycle(action) {
       nativeInputInstall,
       nativeInputRepair,
       nativeInputUninstall,
-      nativeInputSystemSettings,
     ]) button.disabled = false
   }
 }
@@ -1197,9 +1191,6 @@ nativeInputRepair.addEventListener('click', () => {
 })
 nativeInputUninstall.addEventListener('click', () => {
   void runNativeInputLifecycle('uninstall')
-})
-nativeInputSystemSettings.addEventListener('click', () => {
-  window.qwenAudioAgentDesktop.openNativeInputSettings()
 })
 nativeInputAccessibilitySettings.addEventListener('click', () => {
   window.qwenAudioAgentDesktop.openNativeInputAccessibilitySettings()

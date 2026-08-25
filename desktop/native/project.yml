@@ -68,6 +68,7 @@ targets:
         LSBackgroundOnly: true
         LSMinimumSystemVersion: "13.0"
         InputMethodConnectionName: ai.qwenaudio.agent.inputmethod.connection
+        ComponentInvisibleInSystemUI: true
         InputMethodServerControllerClass: QwenInputController
         InputMethodType: Palette
         TISInputSourceID: ai.qwenaudio.agent.inputmethod

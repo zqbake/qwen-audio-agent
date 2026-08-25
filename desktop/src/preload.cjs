@@ -41,9 +41,6 @@ const desktopApi = {
     'qwen-audio-agent:native-input-lifecycle',
     action,
   ),
-  openNativeInputSettings: () => ipcRenderer.send(
-    'qwen-audio-agent:native-input-open-settings',
-  ),
   openNativeInputAccessibilitySettings: () => ipcRenderer.send(
     'qwen-audio-agent:native-input-open-accessibility-settings',
   ),

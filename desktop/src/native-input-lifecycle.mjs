@@ -9,6 +9,7 @@ export class NativeInputLifecycle {
       installed: false,
       registered: false,
       enabled: false,
+      selected: false,
       version: '',
       state: 'unknown',
     }
@@ -58,13 +59,15 @@ export function normalizeLifecycleResult(result = {}) {
   const installed = result.installed === true
   const registered = installed && result.registered === true
   const enabled = registered && result.enabled === true
+  const selected = enabled && result.selected === true
   return {
     installed,
     registered,
     enabled,
+    selected,
     version: installed ? String(result.version || '') : '',
     state: !installed
       ? 'not-installed'
-      : !registered ? 'needs-repair' : !enabled ? 'needs-enable' : 'ready',
+      : !registered || !enabled || !selected ? 'needs-repair' : 'ready',
   }
 }

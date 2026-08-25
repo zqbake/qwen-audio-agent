@@ -22,6 +22,8 @@
 	<string>1</string>
 	<key>InputMethodConnectionName</key>
 	<string>ai.qwenaudio.agent.inputmethod.connection</string>
+	<key>ComponentInvisibleInSystemUI</key>
+	<true/>
 	<key>InputMethodServerControllerClass</key>
 	<string>QwenInputController</string>
 	<key>InputMethodType</key>
