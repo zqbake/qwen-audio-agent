@@ -14,6 +14,7 @@ export class NativeInputFeature {
     this.state = this.enabled ? 'idle' : 'disabled'
     this.shortcutRegistered = false
     this.initializing = null
+    this.host.on?.('failed', () => this.handleHostFailure())
   }
 
   snapshot() {
@@ -101,6 +102,13 @@ export class NativeInputFeature {
     this.unregisterShortcut()
     this.state = 'error'
     this.host.emergencyStop('renderer_lost')
+    return true
+  }
+
+  handleHostFailure() {
+    if (!this.enabled || this.state === 'disabled') return false
+    this.unregisterShortcut()
+    this.state = 'error'
     return true
   }
 

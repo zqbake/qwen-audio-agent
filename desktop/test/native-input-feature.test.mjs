@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
@@ -13,7 +14,7 @@ function harness({ enabled = false, registerResult = true } = {}) {
   const callbacks = new Map()
   const operationRequests = []
   const sessionRequests = []
-  const host = {
+  const host = Object.assign(new EventEmitter(), {
     state: 'idle',
     async start() {
       calls.push('host.start')
@@ -40,7 +41,7 @@ function harness({ enabled = false, registerResult = true } = {}) {
         accepted: true,
       }
     },
-  }
+  })
   const globalShortcut = {
     register(accelerator, callback) {
       calls.push(`shortcut.register:${accelerator}`)
@@ -143,6 +144,26 @@ test('renderer loss is a local emergency stop and blocks the shortcut', async ()
     'host.emergency:renderer_lost',
   ])
   assert.equal(callbacks.size, 0)
+})
+
+test('unexpected Bridge exit makes the feature visibly fail closed', async () => {
+  const { callbacks, calls, feature, host } = harness({ enabled: true })
+  await feature.initialize()
+
+  host.state = 'error'
+  host.emit('failed', { reason: 'child_exit' })
+
+  assert.deepEqual(feature.snapshot(), {
+    enabled: true,
+    state: 'error',
+    shortcutRegistered: false,
+  })
+  assert.equal(callbacks.size, 0)
+  assert.equal(calls.at(-1), 'shortcut.unregister:CommandOrControl+Shift+D')
+  assert.throws(
+    () => feature.sendOperation({ type: 'session.partial' }),
+    /not ready/i,
+  )
 })
 
 test('lifecycle readiness unregisters and restores the native shortcut', async () => {
