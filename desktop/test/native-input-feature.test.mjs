@@ -84,22 +84,41 @@ test('desktop settings keep native input explicitly disabled by default', () => 
   assert.deepEqual(
     {
       enabled: parseSettings('').nativeInputEnabled,
+      accessibilityEnabled: parseSettings('').nativeInputAccessibilityEnabled,
       shortcut: parseSettings('').nativeInputShortcut,
     },
     {
       enabled: false,
+      accessibilityEnabled: false,
       shortcut: 'CommandOrControl+Shift+D',
     },
   )
   const content = updateSettingsContent('', {
     nativeInputEnabled: true,
+    nativeInputAccessibilityEnabled: true,
     nativeInputShortcut: 'CommandOrControl+Alt+D',
   })
   assert.match(content, /QWEN_AUDIO_NATIVE_INPUT_ENABLED=true/)
+  assert.match(content, /QWEN_AUDIO_NATIVE_INPUT_ACCESSIBILITY_ENABLED=true/)
   assert.match(
     content,
     /QWEN_AUDIO_NATIVE_INPUT_SHORTCUT=CommandOrControl\+Alt\+D/,
   )
+})
+
+test('Accessibility enhancement is explicit and forbids event synthesis', () => {
+  const project = readFileSync(
+    new URL('../native/project.yml', import.meta.url),
+    'utf8',
+  )
+  const sources = [
+    'native/Sources/QwenInput/InputController.swift',
+    'native/Sources/QwenInput/SystemAccessibilityTextClient.swift',
+  ].map(file => readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')).join('\n')
+  assert.match(project, /ApplicationServices\.framework/)
+  assert.doesNotMatch(sources, /CGEvent|postToPid|\.post\(/)
+  assert.match(sources, /kAXConfirmAction/)
+  assert.match(sources, /AXIsProcessTrusted/)
 })
 
 test('enabled feature owns one Bridge and an independent shortcut', async () => {

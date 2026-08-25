@@ -874,7 +874,7 @@ ipcMain.handle('qwen-audio-agent:native-input-operation', async (event, value) =
   const type = String(value?.type || '')
   if (![
     'session.arm', 'session.partial', 'session.final', 'session.operation',
-    'session.cancel', 'session.pause', 'session.resume',
+    'session.submit', 'session.cancel', 'session.pause', 'session.resume',
   ].includes(type)) throw new Error('Native input operation is not allowed')
   return nativeInputHost.request({
     type,
@@ -886,6 +886,9 @@ ipcMain.handle('qwen-audio-agent:native-input-operation', async (event, value) =
     ...(value?.target ? { target: String(value.target) } : {}),
     ...(value?.replacement ? { replacement: String(value.replacement) } : {}),
     ...(value?.reason ? { reason: String(value.reason) } : {}),
+    accessibilityEnabled: (
+      process.env.QWEN_AUDIO_NATIVE_INPUT_ACCESSIBILITY_ENABLED === 'true'
+    ),
     statusVisible: mainWindow.isVisible(),
   })
 })
@@ -925,6 +928,13 @@ ipcMain.on('qwen-audio-agent:native-input-open-settings', event => {
   if (!settingsWindow || event.sender !== settingsWindow.webContents) return
   void shell.openExternal(
     'x-apple.systempreferences:com.apple.Keyboard-Settings.extension',
+  )
+})
+
+ipcMain.on('qwen-audio-agent:native-input-open-accessibility-settings', event => {
+  if (!settingsWindow || event.sender !== settingsWindow.webContents) return
+  void shell.openExternal(
+    'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
   )
 })
 

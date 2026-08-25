@@ -24,6 +24,7 @@ const DEFAULTS = {
   autoHideSeconds: 60,
   wakeShortcut: 'CommandOrControl+Shift+Space',
   nativeInputEnabled: false,
+  nativeInputAccessibilityEnabled: false,
   nativeInputShortcut: 'CommandOrControl+Shift+D',
   wakeWordEnabled: false,
   dashscopeApiKey: '',
@@ -50,6 +51,7 @@ const SETTING_KEYS = {
   autoHideSeconds: 'QWEN_AUDIO_DESKTOP_AUTO_HIDE_SECONDS',
   wakeShortcut: 'QWEN_AUDIO_DESKTOP_WAKE_SHORTCUT',
   nativeInputEnabled: 'QWEN_AUDIO_NATIVE_INPUT_ENABLED',
+  nativeInputAccessibilityEnabled: 'QWEN_AUDIO_NATIVE_INPUT_ACCESSIBILITY_ENABLED',
   nativeInputShortcut: 'QWEN_AUDIO_NATIVE_INPUT_SHORTCUT',
   wakeWordEnabled: 'QWEN_AUDIO_WAKE_WORD_ENABLED',
   dashscopeApiKey: 'DASHSCOPE_API_KEY',
@@ -311,6 +313,11 @@ export function parseSettings(content = '', fallback = {}) {
       'QWEN_AUDIO_NATIVE_INPUT_ENABLED',
       fallback.QWEN_AUDIO_NATIVE_INPUT_ENABLED || '',
     )).toLowerCase() === 'true',
+    nativeInputAccessibilityEnabled: String(configured(
+      values,
+      'QWEN_AUDIO_NATIVE_INPUT_ACCESSIBILITY_ENABLED',
+      fallback.QWEN_AUDIO_NATIVE_INPUT_ACCESSIBILITY_ENABLED || '',
+    )).toLowerCase() === 'true',
     nativeInputShortcut: cleanNativeInputShortcut(configured(
       values,
       'QWEN_AUDIO_NATIVE_INPUT_SHORTCUT',
@@ -413,6 +420,9 @@ export function normalizeSettings(settings = {}) {
       settings.wakeShortcut ?? DEFAULTS.wakeShortcut,
     ),
     nativeInputEnabled: Boolean(settings.nativeInputEnabled),
+    nativeInputAccessibilityEnabled: Boolean(
+      settings.nativeInputAccessibilityEnabled,
+    ),
     nativeInputShortcut: cleanNativeInputShortcut(
       settings.nativeInputShortcut ?? DEFAULTS.nativeInputShortcut,
     ),

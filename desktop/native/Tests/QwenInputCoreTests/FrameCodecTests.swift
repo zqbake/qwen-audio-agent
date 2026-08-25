@@ -44,6 +44,21 @@ final class FrameCodecTests: XCTestCase {
         XCTAssertNoThrow(try decoder.finish())
     }
 
+    func testAccessibilitySubmitRoundTripsExplicitEnablement() throws {
+        let submit = NativeInputMessage(
+            type: .sessionSubmit,
+            operationID: "submit-1",
+            accessibilityEnabled: true
+        )
+        XCTAssertEqual(
+            try FrameCodec.decode(
+                NativeInputMessage.self,
+                from: FrameCodec.encode(submit)
+            ),
+            submit
+        )
+    }
+
     func testRejectsZeroOversizedTruncatedAndTrailingFrames() throws {
         XCTAssertThrowsError(try FrameCodec.decode(
             NativeInputMessage.self,

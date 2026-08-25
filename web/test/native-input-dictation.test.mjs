@@ -144,6 +144,95 @@ test('routes partial/final to correlated native operations and never submits con
   assert.deepEqual(gateway.map(item => item.type), ['dictation.start'])
 })
 
+test('voice commit waits for final, confirms through native AX, and acks once', async () => {
+  const { client, gateway, native } = harness()
+  await client.start()
+  client.handle({
+    type: 'dictation.final', text: 'hello', revision: 0, seq: 1,
+  })
+  const request = {
+    type: 'dictation.commit.request', intent: 'conversation',
+    commitId: 'native-commit-1', revision: 1, fingerprint: 'abc123',
+  }
+  assert.equal(client.handle(request), true)
+  assert.equal(client.handle(request), false)
+  await client.settled()
+
+  assert.deepEqual(native.slice(1).map(item => item.type), [
+    'session.final', 'session.submit',
+  ])
+  assert.deepEqual(gateway.filter(item => item.type === 'dictation.commit.ack'), [{
+    type: 'dictation.commit.ack',
+    commitId: 'native-commit-1',
+    revision: 1,
+    fingerprint: 'abc123',
+    submitted: true,
+  }])
+})
+
+test('deterministic edit forwards the Gateway from/to contract to native AX', async () => {
+  const { client, native } = harness()
+  await client.start()
+  assert.equal(client.handle({
+    type: 'dictation.operation', operation: 'replace',
+    from: 'world', to: 'earth', revision: 1, seq: 2,
+  }), true)
+  await client.settled()
+  assert.deepEqual({
+    type: native.at(-1).type,
+    operation: native.at(-1).operation,
+    target: native.at(-1).target,
+    replacement: native.at(-1).replacement,
+  }, {
+    type: 'session.operation', operation: 'replace',
+    target: 'world', replacement: 'earth',
+  })
+})
+
+test('Memory-only correction never calls native AX or ordinary submission', async () => {
+  const { client, gateway, native } = harness()
+  await client.start()
+  const request = {
+    type: 'dictation.commit.request', intent: 'memory-correction',
+    commitId: 'memory-only-1', revision: 0, fingerprint: 'memory-fingerprint',
+  }
+  assert.equal(client.handle(request), true)
+  await client.settled()
+
+  assert.deepEqual(native.map(item => item.type), ['session.arm'])
+  assert.deepEqual(gateway.at(-1), {
+    type: 'dictation.commit.ack',
+    commitId: 'memory-only-1',
+    revision: 0,
+    fingerprint: 'memory-fingerprint',
+    submitted: false,
+    accepted: true,
+    intent: 'memory-correction',
+  })
+})
+
+test('failed AX submit is visible and never acknowledges a submission', async () => {
+  const h = harness({
+    sendNative: operation => Promise.resolve({
+      type: 'operation.result',
+      operationId: operation.operationId,
+      accepted: operation.type !== 'session.submit',
+      ...(operation.type === 'session.submit' ? { reason: 'accessibility_unavailable' } : {}),
+    }),
+  })
+  await h.client.start()
+  h.client.handle({
+    type: 'dictation.commit.request', intent: 'conversation',
+    commitId: 'failed-submit', revision: 0, fingerprint: 'failed',
+  })
+  await h.client.settled()
+  assert.equal(h.client.view().state, 'error')
+  assert.deepEqual(
+    h.gateway.filter(item => item.type === 'dictation.commit.ack'),
+    [],
+  )
+})
+
 test('cancel and native failure stop capture, cancel Gateway, and reject late results', async () => {
   let resolvePartial
   const pendingPartial = new Promise(resolve => { resolvePartial = resolve })

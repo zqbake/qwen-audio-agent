@@ -12,6 +12,7 @@ import {
 const REALTIME_DEFAULTS = {
   wakeShortcut: 'CommandOrControl+Shift+Space',
   nativeInputEnabled: false,
+  nativeInputAccessibilityEnabled: false,
   nativeInputShortcut: 'CommandOrControl+Shift+D',
   wakeWordEnabled: false,
   realtimeProvider: 'dashscope',

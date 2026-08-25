@@ -20,6 +20,7 @@ export class NativeInputDictationClient {
     this.error = ''
     this.generation = 0
     this.pending = Promise.resolve()
+    this.commitReceipts = new Set()
   }
 
   view() {
@@ -111,6 +112,56 @@ export class NativeInputDictationClient {
       return false
     }
     if (!this.active) return false
+    if (event.type === 'dictation.commit.request') {
+      const commitId = String(event.commitId || '')
+      if (!commitId || this.commitReceipts.has(commitId)) return false
+      this.commitReceipts.add(commitId)
+      if (event.intent === 'memory-correction') {
+        this.sendGateway({
+          type: 'dictation.commit.ack',
+          commitId,
+          revision: event.revision,
+          fingerprint: event.fingerprint,
+          submitted: false,
+          accepted: true,
+          intent: 'memory-correction',
+        })
+        return true
+      }
+      const generation = this.generation
+      const operation = {
+        type: 'session.submit',
+        operationId: crypto.randomUUID(),
+      }
+      this.pending = this.pending
+        .then(() => this.sendNative(operation))
+        .then(result => {
+          if (generation !== this.generation || !this.active) return false
+          if (
+            result?.type !== 'operation.result'
+            || result.operationId !== operation.operationId
+            || result.accepted !== true
+          ) {
+            this.failNative(result?.reason || 'accessibility_submit_failed')
+            return false
+          }
+          this.sendGateway({
+            type: 'dictation.commit.ack',
+            commitId,
+            revision: event.revision,
+            fingerprint: event.fingerprint,
+            submitted: true,
+          })
+          return true
+        })
+        .catch(error => {
+          if (generation === this.generation && this.active) {
+            this.failNative(error?.message || String(error))
+          }
+          return false
+        })
+      return true
+    }
     if (!['dictation.partial', 'dictation.final', 'dictation.operation'].includes(event.type)) {
       return false
     }
@@ -193,7 +244,9 @@ function nativeOperation(event) {
     ...(Number.isInteger(event.revision) ? { revision: event.revision } : {}),
     ...(Number.isInteger(event.seq) ? { seq: event.seq } : {}),
     ...(event.operation ? { operation: event.operation } : {}),
-    ...(event.target ? { target: event.target } : {}),
-    ...(event.replacement ? { replacement: event.replacement } : {}),
+    ...(typeof (event.target ?? event.from) === 'string'
+      ? { target: event.target ?? event.from } : {}),
+    ...(typeof (event.replacement ?? event.to) === 'string'
+      ? { replacement: event.replacement ?? event.to } : {}),
   }
 }

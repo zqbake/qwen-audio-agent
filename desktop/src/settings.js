@@ -36,6 +36,12 @@ const resetWakeShortcut = document.querySelector('#reset-wake-shortcut')
 const wakeWordEnabled = document.querySelector('#wake-word-enabled')
 const desktopLanguage = document.querySelector('#desktop-language')
 const nativeInputEnabled = document.querySelector('#native-input-enabled')
+const nativeInputAccessibilityEnabled = document.querySelector(
+  '#native-input-accessibility-enabled',
+)
+const nativeInputAccessibilitySettings = document.querySelector(
+  '#native-input-accessibility-settings',
+)
 const nativeInputStatus = document.querySelector('#native-input-status')
 const nativeInputInstall = document.querySelector('#native-input-install')
 const nativeInputRepair = document.querySelector('#native-input-repair')
@@ -802,6 +808,7 @@ function formSettings() {
     nodePath: nodePathInput.value.trim(),
     language: desktopLanguage.value,
     nativeInputEnabled: nativeInputEnabled.checked,
+    nativeInputAccessibilityEnabled: nativeInputAccessibilityEnabled.checked,
     nativeInputShortcut: settings?.nativeInputShortcut
       || 'CommandOrControl+Shift+D',
   }
@@ -830,6 +837,7 @@ function fingerprint(value) {
     nodePath: value.nodePath,
     language: value.language,
     nativeInputEnabled: value.nativeInputEnabled,
+    nativeInputAccessibilityEnabled: value.nativeInputAccessibilityEnabled,
     nativeInputShortcut: value.nativeInputShortcut,
   })
 }
@@ -1067,6 +1075,9 @@ function render() {
   wakeWordEnabled.checked = settings.wakeWordEnabled || false
   desktopLanguage.value = settings.language || 'auto'
   nativeInputEnabled.checked = settings.nativeInputEnabled === true
+  nativeInputAccessibilityEnabled.checked = (
+    settings.nativeInputAccessibilityEnabled === true
+  )
   applyLanguage(desktopLanguage.value)
   recordingWakeShortcut = false
   renderWakeShortcut()
@@ -1110,6 +1121,7 @@ for (const control of [
   wakeWordEnabled,
   desktopLanguage,
   nativeInputEnabled,
+  nativeInputAccessibilityEnabled,
 ]) {
   control.addEventListener('input', () => {
     showMessage('')
@@ -1188,6 +1200,9 @@ nativeInputUninstall.addEventListener('click', () => {
 })
 nativeInputSystemSettings.addEventListener('click', () => {
   window.qwenAudioAgentDesktop.openNativeInputSettings()
+})
+nativeInputAccessibilitySettings.addEventListener('click', () => {
+  window.qwenAudioAgentDesktop.openNativeInputAccessibilitySettings()
 })
 
 void window.qwenAudioAgentDesktop.nativeInputLifecycle('status')

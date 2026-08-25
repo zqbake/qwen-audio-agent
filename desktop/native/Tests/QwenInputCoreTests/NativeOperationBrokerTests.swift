@@ -71,6 +71,23 @@ final class NativeOperationBrokerTests: XCTestCase {
                        ))
     }
 
+    func testSubmitPreservesDesktopOwnedAccessibilityGate() {
+        let broker = NativeOperationBroker()
+        let target = NativeOperationTarget(
+            sessionID: "session-1",
+            generation: 1,
+            targetID: "target-1"
+        )
+        broker.activate(target)
+        XCTAssertTrue(broker.arm(statusVisible: true).accepted)
+        XCTAssertTrue(broker.enqueue(NativeInputMessage(
+            type: .sessionSubmit,
+            operationID: "submit-1",
+            accessibilityEnabled: true
+        )))
+        XCTAssertEqual(broker.poll(for: target)?.accessibilityEnabled, true)
+    }
+
     func testRejectsWrongTargetReplayAndNonMonotonicSequence() {
         let broker = NativeOperationBroker()
         let target = NativeOperationTarget(

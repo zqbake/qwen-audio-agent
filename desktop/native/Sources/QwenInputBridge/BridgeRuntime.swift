@@ -92,6 +92,9 @@ final class BridgeRuntime {
         case .sessionOperation:
             state = .transcribing
             shouldStop = false
+        case .sessionSubmit:
+            state = .readyToSend
+            shouldStop = false
         case .lifecycleStatus, .lifecycleInstall, .lifecycleRepair,
              .lifecycleUninstall:
             return (try lifecycleResponse(to: request), false)

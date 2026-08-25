@@ -215,6 +215,66 @@ public struct SessionLedger: Sendable {
         return .success(.insert(text: replacement, replacement: documentRange))
     }
 
+    public mutating func accessibilityEdit(
+        _ operation: OwnedTextEdit,
+        generation: UInt64,
+        targetID: UUID
+    ) -> Result<AccessibilityTextReplacement, LedgerError> {
+        if let rejection = validate(generation: generation, targetID: targetID) {
+            return .failure(rejection)
+        }
+        guard
+            let latestOwnedFinalText,
+            let latestOwnedFinalRange,
+            latestOwnedFinalRange.location == NSNotFound
+        else {
+            return .failure(.noOwnedFinalText)
+        }
+
+        let target: String
+        let replacement: String
+        switch operation {
+        case let .replace(editTarget, editReplacement):
+            target = editTarget
+            replacement = editReplacement
+        case let .delete(editTarget):
+            target = editTarget
+            replacement = ""
+        }
+        guard !target.isEmpty else {
+            return .failure(.editTargetNotFound)
+        }
+
+        let ownedText = latestOwnedFinalText as NSString
+        let fullRange = NSRange(location: 0, length: ownedText.length)
+        let first = ownedText.range(of: target, options: [], range: fullRange)
+        guard first.location != NSNotFound else {
+            return .failure(.editTargetNotFound)
+        }
+        let nextLocation = first.location + 1
+        if nextLocation < ownedText.length {
+            let remaining = NSRange(
+                location: nextLocation,
+                length: ownedText.length - nextLocation
+            )
+            if ownedText.range(of: target, options: [], range: remaining).location
+                != NSNotFound {
+                return .failure(.ambiguousEditTarget)
+            }
+        }
+
+        let updatedText = ownedText.replacingCharacters(in: first, with: replacement)
+        self.latestOwnedFinalText = updatedText
+        self.latestOwnedFinalRange = NSRange(
+            location: NSNotFound,
+            length: utf16Length(updatedText)
+        )
+        return .success(AccessibilityTextReplacement(
+            expected: latestOwnedFinalText,
+            replacement: updatedText
+        ))
+    }
+
     public mutating func cancel(
         clientMarkedRange: NSRange,
         generation: UInt64,

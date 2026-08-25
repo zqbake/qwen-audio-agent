@@ -6,6 +6,7 @@ public enum NativeInputMessageType: String, Codable, CaseIterable, Sendable {
     case sessionPartial = "session.partial"
     case sessionFinal = "session.final"
     case sessionOperation = "session.operation"
+    case sessionSubmit = "session.submit"
     case sessionCancel = "session.cancel"
     case sessionPause = "session.pause"
     case sessionResume = "session.resume"
@@ -30,7 +31,7 @@ public struct NativeInputMessage: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case type, text, state, reason, action, installed, registered, enabled
         case version, accepted, revision, generation, operation, target
-        case replacement, statusVisible
+        case replacement, statusVisible, accessibilityEnabled
         case requestID = "requestId"
         case operationID = "operationId"
         case sequence = "seq"
@@ -55,6 +56,7 @@ public struct NativeInputMessage: Codable, Equatable, Sendable {
     public let target: String?
     public let replacement: String?
     public let statusVisible: Bool?
+    public let accessibilityEnabled: Bool?
     public let sessionID: String?
     public let generation: UInt64?
     public let targetID: String?
@@ -78,6 +80,7 @@ public struct NativeInputMessage: Codable, Equatable, Sendable {
         target: String? = nil,
         replacement: String? = nil,
         statusVisible: Bool? = nil,
+        accessibilityEnabled: Bool? = nil,
         sessionID: String? = nil,
         generation: UInt64? = nil,
         targetID: String? = nil
@@ -100,6 +103,7 @@ public struct NativeInputMessage: Codable, Equatable, Sendable {
         self.target = target
         self.replacement = replacement
         self.statusVisible = statusVisible
+        self.accessibilityEnabled = accessibilityEnabled
         self.sessionID = sessionID
         self.generation = generation
         self.targetID = targetID

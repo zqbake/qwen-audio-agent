@@ -120,6 +120,7 @@ public final class NativeOperationBroker: @unchecked Sendable {
             target: operation.target,
             replacement: operation.replacement,
             statusVisible: operation.statusVisible,
+            accessibilityEnabled: operation.accessibilityEnabled,
             sessionID: target.sessionID,
             generation: target.generation,
             targetID: target.targetID

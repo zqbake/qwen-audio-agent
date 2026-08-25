@@ -14,12 +14,15 @@
 		18C1DAD6C4DD15EEC5601FD9 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 97E529D760644859BC504C77 /* Security.framework */; };
 		1986935E02D571BCB9DB3A94 /* TextClientAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85E9FAF73BC1C92B1A6214A0 /* TextClientAdapter.swift */; };
 		1D0661AF1E79C88D416EF685 /* SystemInputMethodLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = F88A81FD5D63F4B15613CC49 /* SystemInputMethodLifecycle.swift */; };
+		22E60AC9BF39D809689D3902 /* SystemAccessibilityTextClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD624C1BC8BD84EC5FEB4D92 /* SystemAccessibilityTextClient.swift */; };
 		25D19EE917B79B6ACF838670 /* libQwenInputCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C841D7EA383D4D382E342DA /* libQwenInputCore.a */; };
 		2C1163C3C3DA1D9F9F32EB89 /* libQwenInputCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C841D7EA383D4D382E342DA /* libQwenInputCore.a */; };
 		3617F3A443DEF060839FC708 /* DynamicPeerCodeValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 588E045EF60E101B7495AE25 /* DynamicPeerCodeValidator.swift */; };
+		37472151377D3A8A82A45AC2 /* AccessibilityEnhancement.swift in Sources */ = {isa = PBXBuildFile; fileRef = B873629C476964A826EBFD3E /* AccessibilityEnhancement.swift */; };
 		44032CAC838B4E7095F771A3 /* NativeRuntimePeer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E37FE60BADFDA91DB2566F8 /* NativeRuntimePeer.swift */; };
 		44FDBA8C71F39045891252FF /* FrameCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E83F22A48A735F44D2E5F41B /* FrameCodecTests.swift */; };
 		45E21E00A294E83B949A3673 /* BridgeRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3628751C0DC9361470DFD8F8 /* BridgeRuntime.swift */; };
+		4906BAA0FBD842A5DB177DE1 /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9D16C60FE5A6548BF0AF3B90 /* ApplicationServices.framework */; };
 		4A725B4EB4088D8F5EF991B2 /* ControllerRegistryState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 721ADAF0107F5823CDC23546 /* ControllerRegistryState.swift */; };
 		4D3A832527594504C522AE85 /* NativeInputCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67B581168B33486F29A4694F /* NativeInputCore.swift */; };
 		53FFCC20116DB89AF7A2B9C1 /* BridgeConnectionStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCDF991A0FDFA79A190157E0 /* BridgeConnectionStateTests.swift */; };
@@ -56,6 +59,7 @@
 		CC8469CB45202045943FDF4D /* SecureRuntimeDirectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AEE3FC51E7D6EB9E4E43BFA /* SecureRuntimeDirectory.swift */; };
 		CE79A680878822DEE5FDCD30 /* SessionLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 321ED6838BE710B2DE2A3A8B /* SessionLedger.swift */; };
 		D353264F02CE93B0069E6D2F /* NativeInputCoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD79B4DC4EECEBB14D9CEAC1 /* NativeInputCoreTests.swift */; };
+		DD08FA56B97C15FA94135C89 /* AccessibilityEnhancementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD144B5C50CEF48007103D18 /* AccessibilityEnhancementTests.swift */; };
 		DDE9CA0DBEC6EB4950C90DA1 /* TextClientAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA841AB10F259EAAC4341A18 /* TextClientAdapterTests.swift */; };
 		E066990E0CB96B55C6FB9B46 /* InputSourceCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5FA45C153157D72549D744F /* InputSourceCoordinator.swift */; };
 		E19C7652473F0AA3BD91DF5B /* BridgeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95B61ED850B3EC90E170A007 /* BridgeClient.swift */; };
@@ -129,14 +133,18 @@
 		97E529D760644859BC504C77 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		9803F3A74B81880860FA4537 /* NativeOperationBrokerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeOperationBrokerTests.swift; sourceTree = "<group>"; };
 		9B96A5981D8C078452FF8DBD /* QwenInputCoreTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = QwenInputCoreTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		9D16C60FE5A6548BF0AF3B90 /* ApplicationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ApplicationServices.framework; path = System/Library/Frameworks/ApplicationServices.framework; sourceTree = SDKROOT; };
 		A4A47C0A672E8E12E4F66D27 /* ControllerRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControllerRegistry.swift; sourceTree = "<group>"; };
 		A6276EBC31F280A4B03E9AFA /* QwenInput.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = QwenInput.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AB4B8909DA07B94EB7928467 /* CodeSignatureValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSignatureValidator.swift; sourceTree = "<group>"; };
 		B01EA50B27573BA9ADCDD45A /* BridgeConnectionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeConnectionState.swift; sourceTree = "<group>"; };
 		B168E38F4B6CC3264F1B67F9 /* SystemInputSourceAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemInputSourceAPI.swift; sourceTree = "<group>"; };
+		B873629C476964A826EBFD3E /* AccessibilityEnhancement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccessibilityEnhancement.swift; sourceTree = "<group>"; };
 		BC381746C0EBAAFA3C56F4E3 /* Carbon.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Carbon.framework; path = System/Library/Frameworks/Carbon.framework; sourceTree = SDKROOT; };
+		BD144B5C50CEF48007103D18 /* AccessibilityEnhancementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccessibilityEnhancementTests.swift; sourceTree = "<group>"; };
 		C85A2B7FC49C6B84F6C18218 /* PeerRequirementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRequirementTests.swift; sourceTree = "<group>"; };
 		C972F27EA1F373474C528542 /* SecureInputGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureInputGate.swift; sourceTree = "<group>"; };
+		CD624C1BC8BD84EC5FEB4D92 /* SystemAccessibilityTextClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemAccessibilityTextClient.swift; sourceTree = "<group>"; };
 		CD79B4DC4EECEBB14D9CEAC1 /* NativeInputCoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeInputCoreTests.swift; sourceTree = "<group>"; };
 		D5FA45C153157D72549D744F /* InputSourceCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputSourceCoordinator.swift; sourceTree = "<group>"; };
 		DA841AB10F259EAAC4341A18 /* TextClientAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextClientAdapterTests.swift; sourceTree = "<group>"; };
@@ -186,6 +194,7 @@
 			files = (
 				77EC0D1027FE098DCC6B423E /* libQwenInputCore.a in Frameworks */,
 				B49D6E60FA83D184C66F7279 /* Security.framework in Frameworks */,
+				4906BAA0FBD842A5DB177DE1 /* ApplicationServices.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -217,6 +226,7 @@
 		233AEA779F12029941356B0D /* QwenInputCoreTests */ = {
 			isa = PBXGroup;
 			children = (
+				BD144B5C50CEF48007103D18 /* AccessibilityEnhancementTests.swift */,
 				FCDF991A0FDFA79A190157E0 /* BridgeConnectionStateTests.swift */,
 				DFB6A421D8ECCD82D397C975 /* ControllerRegistryStateTests.swift */,
 				E83F22A48A735F44D2E5F41B /* FrameCodecTests.swift */,
@@ -265,6 +275,7 @@
 		77910CDC53B0E1F22B4DF76F /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				9D16C60FE5A6548BF0AF3B90 /* ApplicationServices.framework */,
 				BC381746C0EBAAFA3C56F4E3 /* Carbon.framework */,
 				97E529D760644859BC504C77 /* Security.framework */,
 			);
@@ -274,6 +285,7 @@
 		8B5757D91B6406EBA8984D6B /* QwenInputCore */ = {
 			isa = PBXGroup;
 			children = (
+				B873629C476964A826EBFD3E /* AccessibilityEnhancement.swift */,
 				89A7B83D5C9B5BA9CBE04F9D /* AuthenticatedUnixSocket.swift */,
 				B01EA50B27573BA9ADCDD45A /* BridgeConnectionState.swift */,
 				AB4B8909DA07B94EB7928467 /* CodeSignatureValidator.swift */,
@@ -306,6 +318,7 @@
 				645E4C8AEC4F0097B8FFD827 /* InputController.swift */,
 				7A44832D5271CD80CF763AD7 /* main.swift */,
 				C972F27EA1F373474C528542 /* SecureInputGate.swift */,
+				CD624C1BC8BD84EC5FEB4D92 /* SystemAccessibilityTextClient.swift */,
 				85E9FAF73BC1C92B1A6214A0 /* TextClientAdapter.swift */,
 			);
 			path = QwenInput;
@@ -508,6 +521,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				37472151377D3A8A82A45AC2 /* AccessibilityEnhancement.swift in Sources */,
 				5756C62B733A8524756FC260 /* AuthenticatedUnixSocket.swift in Sources */,
 				CB51D96F550CEC6B0893167C /* BridgeConnectionState.swift in Sources */,
 				C3B7DC6EDEBCDDBD78F68845 /* CodeSignatureValidator.swift in Sources */,
@@ -535,6 +549,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				DD08FA56B97C15FA94135C89 /* AccessibilityEnhancementTests.swift in Sources */,
 				53FFCC20116DB89AF7A2B9C1 /* BridgeConnectionStateTests.swift in Sources */,
 				06455682325167D4C9C56AED /* ControllerRegistryStateTests.swift in Sources */,
 				44FDBA8C71F39045891252FF /* FrameCodecTests.swift in Sources */,
@@ -559,6 +574,7 @@
 				C367DF4783999443DD93BE73 /* ControllerRegistry.swift in Sources */,
 				8C08DA1F77D6033BA25BB419 /* InputController.swift in Sources */,
 				C9B818E178D99654569FC357 /* SecureInputGate.swift in Sources */,
+				22E60AC9BF39D809689D3902 /* SystemAccessibilityTextClient.swift in Sources */,
 				1986935E02D571BCB9DB3A94 /* TextClientAdapter.swift in Sources */,
 				F71918A86E1F924952D10474 /* main.swift in Sources */,
 			);

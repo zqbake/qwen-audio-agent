@@ -54,6 +54,7 @@ targets:
     dependencies:
       - target: QwenInputCore
       - sdk: Security.framework
+      - sdk: ApplicationServices.framework
     info:
       path: Resources/QwenInput-Info.plist
       properties:

@@ -9,6 +9,7 @@ final class QwenInputController: IMKInputController, @unchecked Sendable {
     private var ledger: SessionLedger?
     private let clientAdapter = TextClientAdapter()
     private let textOperationController = ClientTextOperationController()
+    private let accessibilityController = AccessibilityOperationController()
     private let safetyGate = SystemSecureInputGate.makeSafetyGate()
     private let bridgeClient = InputBridgeClient()
 
@@ -115,13 +116,14 @@ final class QwenInputController: IMKInputController, @unchecked Sendable {
         }
 
         if message.type == .sessionCancel {
+            let validationLedger = ledger
             guard textOperationController.applyTransaction(
                 to: &ledger,
                 client: client,
                 revalidate: {
                     self.isCurrentCapability(
                         token: token,
-                        ledger: ledger,
+                        ledger: validationLedger,
                         client: client
                     )
                 },
@@ -137,6 +139,27 @@ final class QwenInputController: IMKInputController, @unchecked Sendable {
             }
             self.ledger = ledger
             sessionState = .cancelled
+            return true
+        }
+        if message.type == .sessionSubmit {
+            guard let accessibilityClient = SystemAccessibilityTextClient(
+                expectedPID: NSWorkspace.shared.frontmostApplication?.processIdentifier
+            ), accessibilityController.submit(
+                enabled: message.accessibilityEnabled == true,
+                client: accessibilityClient,
+                revalidate: {
+                    self.canUseAccessibility(
+                        token: token,
+                        ledger: ledger,
+                        client: client,
+                        statusVisible: message.statusVisible == true
+                    )
+                }
+            ) else {
+                sessionState = .blocked
+                return false
+            }
+            sessionState = .readyToSend
             return true
         }
         if message.type == .sessionPause {
@@ -167,6 +190,7 @@ final class QwenInputController: IMKInputController, @unchecked Sendable {
         }
 
         let operation: (inout SessionLedger) -> Result<ClientTextEffect, LedgerError>
+        var accessibilityEdit: OwnedTextEdit?
         switch message.type {
         case .sessionPartial:
             guard let text = message.text else { return false }
@@ -205,24 +229,48 @@ final class QwenInputController: IMKInputController, @unchecked Sendable {
                     targetID: token.targetID
                 )
             }
+            accessibilityEdit = edit
         default:
             return false
         }
-        guard textOperationController.applyTransaction(
+        let validationLedger = ledger
+        let applied = textOperationController.applyTransaction(
             to: &ledger,
             client: client,
             revalidate: {
                 self.canMutateText(
                     token: token,
-                    ledger: ledger,
+                    ledger: validationLedger,
                     client: client,
                     statusVisible: message.statusVisible == true
                 )
             },
             operation: operation
-        ) else {
-            sessionState = .blocked
-            return false
+        )
+        if !applied {
+            let accessibilityValidationLedger = ledger
+            guard let accessibilityEdit,
+                  let accessibilityClient = SystemAccessibilityTextClient(
+                      expectedPID: NSWorkspace.shared.frontmostApplication?.processIdentifier
+                  ), accessibilityController.applyEdit(
+                      accessibilityEdit,
+                      to: &ledger,
+                      generation: token.generation,
+                      targetID: token.targetID,
+                      enabled: message.accessibilityEnabled == true,
+                      client: accessibilityClient,
+                      revalidate: {
+                          self.canUseAccessibility(
+                              token: token,
+                              ledger: accessibilityValidationLedger,
+                              client: client,
+                              statusVisible: message.statusVisible == true
+                          )
+                      }
+                  ) else {
+                sessionState = .blocked
+                return false
+            }
         }
         self.ledger = ledger
         sessionState = message.type == .sessionPartial
@@ -293,6 +341,30 @@ final class QwenInputController: IMKInputController, @unchecked Sendable {
         ) else { return false }
         return safetyGate.evaluate(
             state: sessionState,
+            context: SafetyContext(
+                featureEnabled: true,
+                desktopConnected: true,
+                target: .ready,
+                statusVisibility: statusVisible ? .ready : .unavailable,
+                inputSource: .ready
+            ),
+            hasOwnedPartial: ledger.ownedMarkedRange != nil
+        ) == .captureAllowed
+    }
+
+    private func canUseAccessibility(
+        token: ControllerTargetToken,
+        ledger: SessionLedger,
+        client: IMKTextClientAdapter,
+        statusVisible: Bool
+    ) -> Bool {
+        guard isCurrentCapability(
+            token: token,
+            ledger: ledger,
+            client: client
+        ) else { return false }
+        return safetyGate.evaluate(
+            state: .transcribing,
             context: SafetyContext(
                 featureEnabled: true,
                 desktopConnected: true,

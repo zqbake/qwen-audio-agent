@@ -44,6 +44,9 @@ const desktopApi = {
   openNativeInputSettings: () => ipcRenderer.send(
     'qwen-audio-agent:native-input-open-settings',
   ),
+  openNativeInputAccessibilitySettings: () => ipcRenderer.send(
+    'qwen-audio-agent:native-input-open-accessibility-settings',
+  ),
   onNativeInputSessionRequest: callback => {
     if (typeof callback !== 'function') return () => {}
     const listener = (_event, request) => callback(request)

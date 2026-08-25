@@ -84,6 +84,11 @@ test('accepts lifecycle and correlated native operation message types', () => {
       accepted: false,
       reason: 'target_changed',
     },
+    {
+      type: 'session.submit',
+      operationId: 'submit-1',
+      accessibilityEnabled: true,
+    },
   ]) {
     assert.deepEqual(decodeNativeInputFrame(encodeNativeInputFrame(message)), message)
   }

@@ -6,6 +6,7 @@ export const NATIVE_INPUT_MESSAGE_TYPES = Object.freeze([
   'session.partial',
   'session.final',
   'session.operation',
+  'session.submit',
   'session.cancel',
   'session.pause',
   'session.resume',
