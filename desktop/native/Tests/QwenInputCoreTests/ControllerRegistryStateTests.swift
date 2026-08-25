@@ -9,15 +9,18 @@ final class ControllerRegistryStateTests: XCTestCase {
         XCTAssertEqual(first.generation, 1)
         XCTAssertEqual(first.clientIdentifier, "client-a")
         XCTAssertEqual(registry.current, first)
+        XCTAssertTrue(registry.isCurrent(first))
 
         XCTAssertTrue(registry.deactivate(targetID: first.targetID))
         XCTAssertEqual(registry.generation, 2)
         XCTAssertNil(registry.current)
+        XCTAssertFalse(registry.isCurrent(first))
 
         let second = registry.activate(clientIdentifier: "client-b")
         XCTAssertEqual(second.generation, 3)
         XCTAssertNotEqual(second.targetID, first.targetID)
         XCTAssertEqual(registry.current, second)
+        XCTAssertTrue(registry.isCurrent(second))
     }
 
     func testStaleControllerCannotDeactivateTheCurrentTarget() {

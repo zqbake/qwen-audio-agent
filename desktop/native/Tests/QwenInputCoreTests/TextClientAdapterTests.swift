@@ -109,39 +109,42 @@ final class TextClientAdapterTests: XCTestCase {
         ])
     }
 
-    func testOpaqueEffectsFailWithoutCallingTheClient() {
+    func testCurrentCaretMarkedEffectsUseOfficialNSNotFoundReplacement() throws {
+        let currentCaret = NSRange(location: NSNotFound, length: NSNotFound)
         let partialClient = FakeClient(
             selectedRange: NSRange(location: NSNotFound, length: 0),
             markedRange: NSRange(location: NSNotFound, length: 0)
         )
-        XCTAssertEqual(
-            TextClientAdapter().apply(
-                .setMarked(
-                    text: "opaque",
-                    selection: NSRange(location: 6, length: 0),
-                    replacement: NSRange(location: NSNotFound, length: 0)
-                ),
-                to: partialClient
+        _ = try TextClientAdapter().apply(
+            .setMarked(
+                text: "opaque",
+                selection: NSRange(location: 6, length: 0),
+                replacement: currentCaret
             ),
-            .failure(.unknownSelectedRange)
-        )
-        XCTAssertTrue(partialClient.calls.isEmpty)
+            to: partialClient
+        ).get()
+        XCTAssertEqual(partialClient.calls, [
+            .setMarked(
+                "opaque",
+                selection: NSRange(location: 6, length: 0),
+                replacement: currentCaret
+            ),
+        ])
 
         let finalClient = FakeClient(
             selectedRange: NSRange(location: NSNotFound, length: 0),
-            markedRange: NSRange(location: NSNotFound, length: 6)
+            markedRange: NSRange(location: NSNotFound, length: 0)
         )
-        XCTAssertEqual(
-            TextClientAdapter().apply(.insert(
-                text: "final",
-                replacement: NSRange(location: NSNotFound, length: 6)
-            ), to: finalClient),
-            .failure(.unknownSelectedRange)
-        )
-        XCTAssertTrue(finalClient.calls.isEmpty)
+        _ = try TextClientAdapter().apply(
+            .commitMarked(text: "final", replacement: currentCaret),
+            to: finalClient
+        ).get()
+        XCTAssertEqual(finalClient.calls, [
+            .insert("final", replacement: currentCaret),
+        ])
     }
 
-    func testControllerRejectsOpaquePartialFinalAndCancelWithoutCallingClient() {
+    func testControllerAppliesCurrentCaretPartialFinalAndCancelTransactionally() throws {
         let sessionID = UUID()
         let targetID = UUID()
         var partialLedger = SessionLedger(
@@ -153,63 +156,111 @@ final class TextClientAdapterTests: XCTestCase {
             selectedRange: NSRange(location: NSNotFound, length: 0),
             markedRange: NSRange(location: NSNotFound, length: 0)
         )
-        let partialResult = partialLedger.partial(
-            text: "opaque",
-            selectedRange: partialClient.selectedRange,
-            clientMarkedRange: partialClient.markedRange,
-            generation: 3,
-            targetID: targetID
+        XCTAssertTrue(
+            ClientTextOperationController().applyTransaction(
+                to: &partialLedger,
+                client: partialClient,
+                operation: { candidate in
+                    candidate.partial(
+                        text: "opaque",
+                        selectedRange: partialClient.selectedRange,
+                        clientMarkedRange: partialClient.markedRange,
+                        generation: 3,
+                        targetID: targetID
+                    )
+                }
+            )
         )
+        XCTAssertEqual(partialClient.calls.count, 1)
 
-        XCTAssertFalse(
-            ClientTextOperationController().apply(partialResult, to: partialClient)
-        )
-        XCTAssertTrue(partialClient.calls.isEmpty)
-
-        let opaque = NSRange(location: NSNotFound, length: 6)
-        var finalLedger = SessionLedger(
-            sessionID: sessionID,
-            generation: 3,
-            targetID: targetID
-        )
-        finalLedger.ownedMarkedRange = opaque
         let finalClient = FakeClient(
             selectedRange: NSRange(location: NSNotFound, length: 0),
-            markedRange: opaque
+            markedRange: NSRange(location: NSNotFound, length: 0)
         )
-        let finalResult = finalLedger.final(
-            text: "final",
-            selectedRange: finalClient.selectedRange,
-            clientMarkedRange: finalClient.markedRange,
-            generation: 3,
-            targetID: targetID
+        XCTAssertTrue(
+            ClientTextOperationController().applyTransaction(
+                to: &partialLedger,
+                client: finalClient,
+                operation: { candidate in
+                    candidate.final(
+                        text: "final",
+                        selectedRange: finalClient.selectedRange,
+                        clientMarkedRange: finalClient.markedRange,
+                        generation: 3,
+                        targetID: targetID
+                    )
+                }
+            )
         )
-
-        XCTAssertFalse(
-            ClientTextOperationController().apply(finalResult, to: finalClient)
-        )
-        XCTAssertTrue(finalClient.calls.isEmpty)
+        XCTAssertEqual(finalClient.calls.count, 1)
 
         var cancelLedger = SessionLedger(
             sessionID: UUID(),
             generation: 3,
             targetID: targetID
         )
-        cancelLedger.ownedMarkedRange = opaque
         let cancelClient = FakeClient(
             selectedRange: NSRange(location: NSNotFound, length: 0),
-            markedRange: opaque
+            markedRange: NSRange(location: NSNotFound, length: 0)
         )
-        let cancelResult = cancelLedger.cancel(
+        _ = try cancelLedger.partial(
+            text: "cancel",
+            selectedRange: cancelClient.selectedRange,
             clientMarkedRange: cancelClient.markedRange,
             generation: 3,
             targetID: targetID
+        ).get()
+        XCTAssertTrue(
+            ClientTextOperationController().applyTransaction(
+                to: &cancelLedger,
+                client: cancelClient,
+                operation: { candidate in
+                    candidate.cancel(
+                        clientMarkedRange: cancelClient.markedRange,
+                        generation: 3,
+                        targetID: targetID
+                    )
+                }
+            )
         )
+        XCTAssertEqual(cancelClient.calls.count, 2)
+    }
+
+    func testControllerRevokesCurrentCaretCapabilityBeforeClientMutation() {
+        let targetID = UUID()
+        var ledger = SessionLedger(
+            sessionID: UUID(),
+            generation: 3,
+            targetID: targetID
+        )
+        let client = FakeClient(
+            selectedRange: NSRange(location: NSNotFound, length: 0),
+            markedRange: NSRange(location: NSNotFound, length: 0)
+        )
+        var checks = 0
 
         XCTAssertFalse(
-            ClientTextOperationController().apply(cancelResult, to: cancelClient)
+            ClientTextOperationController().applyTransaction(
+                to: &ledger,
+                client: client,
+                revalidate: {
+                    checks += 1
+                    return checks == 1
+                },
+                operation: { candidate in
+                    candidate.partial(
+                        text: "must not write",
+                        selectedRange: client.selectedRange,
+                        clientMarkedRange: client.markedRange,
+                        generation: 3,
+                        targetID: targetID
+                    )
+                }
+            )
         )
-        XCTAssertTrue(cancelClient.calls.isEmpty)
+        XCTAssertEqual(checks, 2)
+        XCTAssertTrue(client.calls.isEmpty)
+        XCTAssertNil(ledger.ownedMarkedRange)
     }
 
     func testControllerRejectsOwnedFinalWhenRangeBecomesOpaqueBeforeInsert() throws {

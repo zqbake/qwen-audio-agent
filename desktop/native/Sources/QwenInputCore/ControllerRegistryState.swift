@@ -22,6 +22,10 @@ public struct ControllerRegistryState: Sendable {
 
     public init() {}
 
+    public func isCurrent(_ token: ControllerTargetToken) -> Bool {
+        current == token
+    }
+
     @discardableResult
     public mutating func activate(
         clientIdentifier: String,

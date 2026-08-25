@@ -6,6 +6,7 @@ final class BridgeConnectionStateTests: XCTestCase {
         var state = BridgeConnectionState(failureThreshold: 3)
 
         XCTAssertTrue(state.needsActivation)
+        XCTAssertFalse(state.isConnected)
         XCTAssertEqual(state.recordFailure(), .none)
         XCTAssertEqual(state.recordFailure(), .none)
         XCTAssertEqual(state.recordFailure(), .failClosed)
@@ -14,8 +15,10 @@ final class BridgeConnectionStateTests: XCTestCase {
 
         state.recordSuccess()
         XCTAssertFalse(state.needsActivation)
+        XCTAssertTrue(state.isConnected)
         XCTAssertEqual(state.recordFailure(), .none)
         XCTAssertTrue(state.needsActivation)
+        XCTAssertFalse(state.isConnected)
         state.recordSuccess()
         XCTAssertFalse(state.needsActivation)
     }

@@ -86,22 +86,55 @@ final class SessionLedgerTests: XCTestCase {
         XCTAssertEqual(ledger.ownedMarkedRange, range(2, 2))
     }
 
-    func testFirstPartialRejectsWhenSelectionAndMarkedLocationAreOpaque() {
+    func testCurrentCaretPartialAndFinalStayOwnedWithoutAbsoluteRanges() throws {
         var ledger = ledger()
+        let currentCaret = range(NSNotFound, NSNotFound)
 
         XCTAssertEqual(
-            ledger.partial(
+            try ledger.partial(
                 text: "opaque",
                 selectedRange: range(NSNotFound, 0),
                 clientMarkedRange: range(NSNotFound, 0),
                 generation: 3,
                 targetID: targetID
-            ),
-            .failure(.unknownClientRange)
+            ).get(),
+            .setMarked(
+                text: "opaque",
+                selection: range(6, 0),
+                replacement: currentCaret
+            )
+        )
+        XCTAssertEqual(ledger.ownedMarkedRange, range(NSNotFound, 6))
+
+        XCTAssertEqual(
+            try ledger.partial(
+                text: "opaque next",
+                selectedRange: range(NSNotFound, 0),
+                clientMarkedRange: range(NSNotFound, 0),
+                generation: 3,
+                targetID: targetID
+            ).get(),
+            .setMarked(
+                text: "opaque next",
+                selection: range(11, 0),
+                replacement: currentCaret
+            )
+        )
+        XCTAssertEqual(ledger.ownedMarkedRange, range(NSNotFound, 11))
+
+        XCTAssertEqual(
+            try ledger.final(
+                text: "opaque final",
+                selectedRange: range(NSNotFound, 0),
+                clientMarkedRange: range(NSNotFound, 0),
+                generation: 3,
+                targetID: targetID
+            ).get(),
+            .commitMarked(text: "opaque final", replacement: currentCaret)
         )
         XCTAssertNil(ledger.ownedMarkedRange)
-        XCTAssertNil(ledger.latestOwnedFinalRange)
-        XCTAssertNil(ledger.latestOwnedFinalText)
+        XCTAssertEqual(ledger.latestOwnedFinalRange, range(NSNotFound, 12))
+        XCTAssertEqual(ledger.latestOwnedFinalText, "opaque final")
     }
 
     func testFirstPartialUsesKnownEmptyMarkedLocationWhenSelectionIsOpaque() throws {
@@ -124,36 +157,26 @@ final class SessionLedgerTests: XCTestCase {
         XCTAssertEqual(ledger.ownedMarkedRange, range(8, 5))
     }
 
-    func testOpaqueOwnedFinalAndCancelFailClosedWithoutMutatingLedger() {
+    func testCurrentCaretCancelRemovesOnlyTheOwnedComposition() throws {
         let opaque = range(NSNotFound, 6)
-        var finalLedger = ledger()
-        finalLedger.ownedMarkedRange = opaque
-
-        XCTAssertEqual(
-            finalLedger.final(
-                text: "final",
-                selectedRange: range(NSNotFound, 0),
-                clientMarkedRange: opaque,
-                generation: 3,
-                targetID: targetID
-            ),
-            .failure(.unknownClientRange)
-        )
-        XCTAssertEqual(finalLedger.ownedMarkedRange, opaque)
-        XCTAssertNil(finalLedger.latestOwnedFinalRange)
-        XCTAssertNil(finalLedger.latestOwnedFinalText)
-
         var cancelLedger = ledger()
-        cancelLedger.ownedMarkedRange = opaque
+        _ = try cancelLedger.partial(
+            text: "opaque",
+            selectedRange: range(NSNotFound, 0),
+            clientMarkedRange: range(NSNotFound, 0),
+            generation: 3,
+            targetID: targetID
+        ).get()
+        XCTAssertEqual(cancelLedger.ownedMarkedRange, opaque)
         XCTAssertEqual(
-            cancelLedger.cancel(
-                clientMarkedRange: opaque,
+            try cancelLedger.cancel(
+                clientMarkedRange: range(NSNotFound, 0),
                 generation: 3,
                 targetID: targetID
-            ),
-            .failure(.unknownClientRange)
+            ).get(),
+            .removeMarked(replacement: range(NSNotFound, NSNotFound))
         )
-        XCTAssertEqual(cancelLedger.ownedMarkedRange, opaque)
+        XCTAssertNil(cancelLedger.ownedMarkedRange)
     }
 
     func testReplaceAndDeleteStayInsideOneLatestOwnedFinalMatch() throws {
@@ -215,17 +238,7 @@ final class SessionLedgerTests: XCTestCase {
         }
         XCTAssertEqual(activeLedger.latestOwnedFinalText, "x x")
 
-        var unknown = ledger()
-        XCTAssertThrowsError(try unknown.final(
-            text: "never inserted",
-            selectedRange: range(NSNotFound, 0),
-            clientMarkedRange: range(NSNotFound, 0),
-            generation: 3,
-            targetID: targetID
-        ).get()) { error in
-            XCTAssertEqual(error as? LedgerError, .unknownClientRange)
-        }
-        XCTAssertNil(unknown.latestOwnedFinalRange)
+        XCTAssertNil(ledger().latestOwnedFinalRange)
     }
 
     func testStaleGenerationOrTargetCannotProduceAnEffect() throws {

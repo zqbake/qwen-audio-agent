@@ -41,4 +41,13 @@ final class ControllerRegistry: @unchecked Sendable {
         _ = state.close(targetID: targetID)
         activeController = nil
     }
+
+    func isActive(
+        _ controller: QwenInputController,
+        token: ControllerTargetToken
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeController === controller && state.isCurrent(token)
+    }
 }

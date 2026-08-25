@@ -5,6 +5,7 @@ public enum BridgeConnectionAction: Equatable, Sendable {
 
 public struct BridgeConnectionState: Sendable {
     public private(set) var needsActivation = true
+    public var isConnected: Bool { !needsActivation }
 
     private let failureThreshold: Int
     private var consecutiveFailures = 0

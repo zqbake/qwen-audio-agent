@@ -118,6 +118,13 @@ final class QwenInputController: IMKInputController, @unchecked Sendable {
             guard textOperationController.applyTransaction(
                 to: &ledger,
                 client: client,
+                revalidate: {
+                    self.isCurrentCapability(
+                        token: token,
+                        ledger: ledger,
+                        client: client
+                    )
+                },
                 operation: { candidate in
                     candidate.cancel(
                         clientMarkedRange: client.markedRange,
@@ -204,6 +211,14 @@ final class QwenInputController: IMKInputController, @unchecked Sendable {
         guard textOperationController.applyTransaction(
             to: &ledger,
             client: client,
+            revalidate: {
+                self.canMutateText(
+                    token: token,
+                    ledger: ledger,
+                    client: client,
+                    statusVisible: message.statusVisible == true
+                )
+            },
             operation: operation
         ) else {
             sessionState = .blocked
@@ -245,5 +260,47 @@ final class QwenInputController: IMKInputController, @unchecked Sendable {
         sessionState = .cancelled
         targetToken = nil
         ledger = nil
+    }
+
+    private func isCurrentCapability(
+        token: ControllerTargetToken,
+        ledger: SessionLedger,
+        client: IMKTextClientAdapter
+    ) -> Bool {
+        guard targetToken == token,
+              client.uniqueIdentifier == token.clientIdentifier,
+              ControllerRegistry.shared.isActive(self, token: token) else {
+            return false
+        }
+        let target = NativeOperationTarget(
+            sessionID: ledger.sessionID.uuidString,
+            generation: token.generation,
+            targetID: token.targetID.uuidString
+        )
+        return bridgeClient.isConnected(controller: self, target: target)
+    }
+
+    private func canMutateText(
+        token: ControllerTargetToken,
+        ledger: SessionLedger,
+        client: IMKTextClientAdapter,
+        statusVisible: Bool
+    ) -> Bool {
+        guard isCurrentCapability(
+            token: token,
+            ledger: ledger,
+            client: client
+        ) else { return false }
+        return safetyGate.evaluate(
+            state: sessionState,
+            context: SafetyContext(
+                featureEnabled: true,
+                desktopConnected: true,
+                target: .ready,
+                statusVisibility: statusVisible ? .ready : .unavailable,
+                inputSource: .ready
+            ),
+            hasOwnedPartial: ledger.ownedMarkedRange != nil
+        ) == .captureAllowed
     }
 }

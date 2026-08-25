@@ -65,6 +65,17 @@ final class InputBridgeClient: @unchecked Sendable {
         }
     }
 
+    func isConnected(
+        controller expectedController: QwenInputController,
+        target expectedTarget: NativeOperationTarget
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return controller === expectedController
+            && target == expectedTarget
+            && connection.isConnected
+    }
+
     private func startPolling() {
         let source = DispatchSource.makeTimerSource(queue: queue)
         source.schedule(deadline: .now(), repeating: .milliseconds(25))

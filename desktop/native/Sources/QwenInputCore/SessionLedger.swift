@@ -28,15 +28,22 @@ public struct SessionLedger: Sendable {
         let replacement: NSRange
         let location: Int
         if let ownedMarkedRange {
-            guard ownedMarkedRange.location != NSNotFound,
-                  clientMarkedRange.location != NSNotFound else {
-                return .failure(.unknownClientRange)
+            if ownedMarkedRange.location == NSNotFound {
+                guard clientMarkedRange.location == NSNotFound else {
+                    return .failure(.markedRangeMismatch)
+                }
+                replacement = currentCaretRange
+                location = NSNotFound
+            } else {
+                guard clientMarkedRange.location != NSNotFound else {
+                    return .failure(.unknownClientRange)
+                }
+                guard clientMarkedRange == ownedMarkedRange else {
+                    return .failure(.markedRangeMismatch)
+                }
+                replacement = ownedMarkedRange
+                location = ownedMarkedRange.location
             }
-            guard clientMarkedRange == ownedMarkedRange else {
-                return .failure(.markedRangeMismatch)
-            }
-            replacement = ownedMarkedRange
-            location = ownedMarkedRange.location
         } else if clientMarkedRange.location != NSNotFound {
             guard clientMarkedRange.length == 0,
                   selectedRange.location == NSNotFound
@@ -46,11 +53,13 @@ public struct SessionLedger: Sendable {
             replacement = clientMarkedRange
             location = clientMarkedRange.location
         } else {
-            guard selectedRange.location != NSNotFound else {
-                return .failure(.unknownClientRange)
+            if selectedRange.location == NSNotFound {
+                replacement = currentCaretRange
+                location = NSNotFound
+            } else {
+                replacement = NSRange(location: NSNotFound, length: 0)
+                location = selectedRange.location
             }
-            replacement = NSRange(location: NSNotFound, length: 0)
-            location = selectedRange.location
         }
 
         let length = utf16Length(text)
@@ -76,24 +85,39 @@ public struct SessionLedger: Sendable {
         let effect: ClientTextEffect
         let location: Int
         if let ownedMarkedRange {
-            guard ownedMarkedRange.location != NSNotFound,
-                  clientMarkedRange.location != NSNotFound else {
-                return .failure(.unknownClientRange)
+            if ownedMarkedRange.location == NSNotFound {
+                guard clientMarkedRange.location == NSNotFound else {
+                    return .failure(.markedRangeMismatch)
+                }
+                location = NSNotFound
+                effect = .commitMarked(text: text, replacement: currentCaretRange)
+            } else {
+                guard clientMarkedRange.location != NSNotFound else {
+                    return .failure(.unknownClientRange)
+                }
+                guard clientMarkedRange == ownedMarkedRange else {
+                    return .failure(.markedRangeMismatch)
+                }
+                location = ownedMarkedRange.location
+                effect = .commitMarked(text: text, replacement: ownedMarkedRange)
             }
-            guard clientMarkedRange == ownedMarkedRange else {
-                return .failure(.markedRangeMismatch)
-            }
-            location = ownedMarkedRange.location
-            effect = .commitMarked(text: text, replacement: ownedMarkedRange)
         } else {
-            guard selectedRange.location != NSNotFound else {
-                return .failure(.unknownClientRange)
+            if selectedRange.location == NSNotFound {
+                guard clientMarkedRange.location == NSNotFound else {
+                    return .failure(.markedRangeMismatch)
+                }
+                location = NSNotFound
+                effect = .commitSelection(
+                    text: text,
+                    expectedSelection: currentCaretRange
+                )
+            } else {
+                location = selectedRange.location
+                effect = .commitSelection(
+                    text: text,
+                    expectedSelection: selectedRange
+                )
             }
-            location = selectedRange.location
-            effect = .commitSelection(
-                text: text,
-                expectedSelection: selectedRange
-            )
         }
 
         ownedMarkedRange = nil
@@ -111,8 +135,13 @@ public struct SessionLedger: Sendable {
         guard let ownedMarkedRange else {
             return .failure(.markedRangeMismatch)
         }
-        guard ownedMarkedRange.location != NSNotFound else {
-            return .failure(.unknownClientRange)
+        if ownedMarkedRange.location == NSNotFound {
+            guard clientMarkedRange.location != NSNotFound,
+                  clientMarkedRange.length == ownedMarkedRange.length else {
+                return .failure(.markedRangeMismatch)
+            }
+            self.ownedMarkedRange = clientMarkedRange
+            return .success(())
         }
         guard clientMarkedRange.location != NSNotFound,
               ownedMarkedRange == clientMarkedRange else {
@@ -197,8 +226,14 @@ public struct SessionLedger: Sendable {
         guard let ownedMarkedRange else {
             return .success(.none)
         }
-        guard ownedMarkedRange.location != NSNotFound,
-              clientMarkedRange.location != NSNotFound else {
+        if ownedMarkedRange.location == NSNotFound {
+            guard clientMarkedRange.location == NSNotFound else {
+                return .failure(.markedRangeMismatch)
+            }
+            self.ownedMarkedRange = nil
+            return .success(.removeMarked(replacement: currentCaretRange))
+        }
+        guard clientMarkedRange.location != NSNotFound else {
             return .failure(.unknownClientRange)
         }
         guard clientMarkedRange == ownedMarkedRange else {
@@ -227,5 +262,9 @@ public struct SessionLedger: Sendable {
 
     private func utf16Length(_ text: String) -> Int {
         (text as NSString).length
+    }
+
+    private var currentCaretRange: NSRange {
+        NSRange(location: NSNotFound, length: NSNotFound)
     }
 }
