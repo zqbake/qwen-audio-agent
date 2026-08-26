@@ -13,7 +13,9 @@ macOS 输入源状态；未经机器所有者明确授权，不得执行人工�
   已覆盖。当前 macOS 26.5.1 arm64 真机上，per-user Debug/ad-hoc 与 Apple
   Development 签名探针均显示 register/enable 返回成功但状态仍 disabled，select
   返回 `paramErr`（`-50`）；事务已回滚且普通键盘 source 不变。下一步明确门禁是
-  系统级安装探针，或 Developer ID/公证产物。
+  系统级安装探针，或 Developer ID/公证产物。一次系统级复制已准确触发 macOS
+  `SecurityAgent`，但因自动化不得操作管理员认证界面，在输入凭据前取消并完整
+  清理；下一台 Mac 必须由用户本人完成该单一管理员认证。
 - 跨应用 InputMethodKit 真实交互：已用 fake transcript 验证 TextEdit 与
   Safari textarea/contenteditable/password；Terminal 和更广应用矩阵仍未完成。
 - 物理麦克风与 TCC 授权链路：未运行。
@@ -78,6 +80,65 @@ codesign --verify --deep --strict \
 
 两个原生产物都必须同时包含 `arm64` 与 `x86_64`。本地构建使用 ad-hoc
 签名，只能证明构建和完整性，不能代替正式签名、公证与 Gatekeeper 验收。
+
+## 跨机系统级 hidden-palette 探针
+
+这是可回滚的 OS 可行性探针，不是 Desktop 的 Install/Repair 事务；当前产品
+生命周期仍安装到 `~/Library/Input Methods`。必须使用没有既有 Qwen input
+source、系统级/用户级 Qwen bundle 的测试账户或机器，否则无法证明只清理本轮
+状态。
+
+从用户 fork 的独立交付分支 checkout，并在完全不注入 provider key 的情况下
+构建：
+
+```sh
+git clone --branch zq-77-cross-machine-test-20260826 --single-branch \
+  https://github.com/zqbake/qwen-audio-agent.git qwen-audio-agent-zq77
+cd qwen-audio-agent-zq77
+git rev-parse HEAD
+npm ci
+npm run native-input:test
+npm test
+npm run lint
+npm run build
+npm run native-input:build:release
+lipo -archs dist/native-input/QwenInputBridge
+lipo -archs "dist/native-input/Qwen Input.app/Contents/MacOS/Qwen Input"
+codesign --verify --strict \
+  -R='identifier "ai.qwenaudio.agent.inputbridge"' \
+  dist/native-input/QwenInputBridge
+codesign --verify --deep --strict \
+  -R='identifier "ai.qwenaudio.agent.inputmethod"' \
+  "dist/native-input/Qwen Input.app"
+```
+
+逐阶段可直接复制的基线记录、Qwen 零既有状态断言、公开 TIS
+`register → enable → select → fresh verify` Swift 命令、普通键盘恢复与清理
+断言，以配套英文文档
+`docs/desktop/native-input-testing.md#cross-machine-system-level-palette-probe`
+为唯一可执行源，避免两套长脚本漂移。执行时按以下顺序，不得跳步：
+
+1. 在同一 shell 保存 `BASELINE_KEYBOARD`、系统 bundle 路径和当前用户
+   `qwen-ni-<uid>` runtime 路径；断言两处 Qwen bundle 不存在且 Qwen TIS
+   count=0。
+2. 运行文档中的 `open -R "$BUILT_QWEN_BUNDLE"` 与
+   `open '/Library/Input Methods'`。只复制已完成 codesign 校验的
+   `Qwen Input.app`；管理员密码只由用户本人在 `SecurityAgent` 中输入，
+   不得进入 Terminal、history、文件或自动化。
+3. 若出现麦克风、Accessibility、Input Monitoring、Full Disk Access 或任何
+   非该单文件复制的权限提示，立即停止并进入回滚。
+4. 确认系统 bundle 存在且签名仍有效后，分别启动四个 fresh Swift 进程执行
+   register、enable、select、verify。三个 mutation 返回值必须都是 `0`；
+   最终必须是 `count=1 / enabled=true / selected=true`，且普通键盘逐字等于
+   `BASELINE_KEYBOARD`。
+5. 本轮到此为止，不进入 TextEdit/Safari、Accessibility、麦克风或 live
+   provider。
+6. 无论成功失败都执行英文文档的 rollback：只 disable Qwen；在 Finder 中只把
+   系统级 Qwen bundle 移到废纸篓并由用户本人再次认证；只永久删除该测试 bundle，
+   不清空整个废纸篓；恢复基线普通键盘，停止 Qwen/Bridge，校验属主与 0700 mode
+   后删除当前用户 runtime 目录。
+7. 最终 fresh 断言必须同时满足：普通键盘与基线逐字相同、Qwen TIS count=0、
+   两处 bundle 不存在、runtime 不存在、Qwen/Bridge 进程不存在。
 
 ## 授权边界
 

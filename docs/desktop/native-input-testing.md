@@ -16,8 +16,10 @@ manual matrix without explicit authorization from the machine owner.
   machine, the per-user Debug/ad-hoc and Apple Development-signed probes both
   returned success from register/enable but remained disabled; select returned
   `paramErr` (`-50`). The transaction rolled back and left the keyboard source
-  unchanged. A system-level installation probe or Developer ID/notarized
-  artifact is the next explicit authorization/release gate.
+  unchanged. A system-level copy reached the macOS `SecurityAgent` prompt but
+  was cancelled before credentials were entered because automation cannot
+  operate that prompt. A human-authenticated system-level probe or Developer
+  ID/notarized artifact is the next explicit authorization/release gate.
 - Cross-application InputMethodKit interaction: verified with fake transcript in
   TextEdit and Safari textarea/contenteditable/password controls. Terminal and
   the broader application matrix remain open.
@@ -89,6 +91,240 @@ codesign --verify --deep --strict \
 Both native artifacts must contain `arm64` and `x86_64`. Local builds are
 ad-hoc signed and are only build/integrity evidence; they are not notarized
 release evidence.
+
+## Cross-machine system-level palette probe
+
+This is a reversible OS-feasibility probe, not the Desktop Install/Repair
+transaction: the current product lifecycle still installs under
+`~/Library/Input Methods`. Use a clean test account or machine. Do not run the
+probe when a Qwen input source or either Qwen bundle path already exists,
+because cleanup must remove only artifacts created by this run.
+
+Clone the independent delivery branch and build without any provider key:
+
+```sh
+git clone --branch zq-77-cross-machine-test-20260826 --single-branch \
+  https://github.com/zqbake/qwen-audio-agent.git qwen-audio-agent-zq77
+cd qwen-audio-agent-zq77
+git rev-parse HEAD
+npm ci
+npm run native-input:test
+npm test
+npm run lint
+npm run build
+npm run native-input:build:release
+lipo -archs dist/native-input/QwenInputBridge
+lipo -archs "dist/native-input/Qwen Input.app/Contents/MacOS/Qwen Input"
+codesign --verify --strict \
+  -R='identifier "ai.qwenaudio.agent.inputbridge"' \
+  dist/native-input/QwenInputBridge
+codesign --verify --deep --strict \
+  -R='identifier "ai.qwenaudio.agent.inputmethod"' \
+  "dist/native-input/Qwen Input.app"
+```
+
+Record the ordinary keyboard and prove the probe owns no pre-existing Qwen
+state. Keep this shell open through cleanup; `BASELINE_KEYBOARD` is
+non-sensitive, process-local state.
+
+```sh
+QWEN_SOURCE_ID=ai.qwenaudio.agent.inputmethod
+SYSTEM_QWEN_BUNDLE='/Library/Input Methods/Qwen Input.app'
+BUILT_QWEN_BUNDLE="$PWD/dist/native-input/Qwen Input.app"
+BASELINE_KEYBOARD="$(swift -e '
+import Carbon.HIToolbox
+let source = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+let pointer = TISGetInputSourceProperty(source, kTISPropertyInputSourceID)!
+print(Unmanaged<CFString>.fromOpaque(pointer).takeUnretainedValue())
+')"
+RUNTIME_DIR="$(swift -e '
+import Darwin
+import Foundation
+print(FileManager.default.temporaryDirectory
+  .appendingPathComponent("qwen-ni-\(geteuid())").path)
+')"
+export QWEN_SOURCE_ID SYSTEM_QWEN_BUNDLE BUILT_QWEN_BUNDLE
+export BASELINE_KEYBOARD RUNTIME_DIR
+printf 'baseline.keyboard=%s\n' "$BASELINE_KEYBOARD"
+test ! -e "$SYSTEM_QWEN_BUNDLE"
+test ! -e "$HOME/Library/Input Methods/Qwen Input.app"
+test "$(swift -e '
+import Carbon.HIToolbox
+let key = kTISPropertyInputSourceID!
+let filter = [key as String: CommandLine.arguments[1]] as CFDictionary
+let values = TISCreateInputSourceList(filter, true)?.takeRetainedValue()
+let list = values.map { $0 as NSArray } ?? NSArray()
+print(list.count)
+' "$QWEN_SOURCE_ID")" = 0
+```
+
+Open the two Finder locations. Manually copy only `Qwen Input.app` into the
+system folder and personally complete the administrator `SecurityAgent`
+prompt. Do not put a password in Terminal, shell history, a file, or automation.
+Stop if macOS asks for Microphone, Accessibility, Input Monitoring, Full Disk
+Access, or any permission other than this one file copy.
+
+```sh
+open -R "$BUILT_QWEN_BUNDLE"
+open '/Library/Input Methods'
+```
+
+After the Finder copy finishes, verify the exact installed artifact, then run
+each public TIS stage in a separate process. Every mutation must print `0`;
+any other value stops the probe and goes directly to cleanup.
+
+```sh
+test -d "$SYSTEM_QWEN_BUNDLE"
+codesign --verify --deep --strict "$SYSTEM_QWEN_BUNDLE"
+
+swift -e '
+import Carbon.HIToolbox
+import Foundation
+let url = URL(fileURLWithPath: CommandLine.arguments[1])
+print("register=\(TISRegisterInputSource(url as CFURL))")
+' "$SYSTEM_QWEN_BUNDLE"
+
+swift -e '
+import Carbon.HIToolbox
+import Darwin
+func source(_ id: String) -> TISInputSource? {
+  let key = kTISPropertyInputSourceID!
+  let filter = [key as String: id] as CFDictionary
+  guard let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue()
+  else { return nil }
+  let values = list as NSArray
+  guard let value = values.firstObject else { return nil }
+  return unsafeBitCast(value as AnyObject, to: TISInputSource.self)
+}
+guard let value = source(CommandLine.arguments[1]) else {
+  print("enable=missing"); exit(2)
+}
+print("enable=\(TISEnableInputSource(value))")
+' "$QWEN_SOURCE_ID"
+
+swift -e '
+import Carbon.HIToolbox
+import Darwin
+func source(_ id: String) -> TISInputSource? {
+  let key = kTISPropertyInputSourceID!
+  let filter = [key as String: id] as CFDictionary
+  guard let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue()
+  else { return nil }
+  let values = list as NSArray
+  guard let value = values.firstObject else { return nil }
+  return unsafeBitCast(value as AnyObject, to: TISInputSource.self)
+}
+guard let value = source(CommandLine.arguments[1]) else {
+  print("select=missing"); exit(2)
+}
+print("select=\(TISSelectInputSource(value))")
+' "$QWEN_SOURCE_ID"
+
+swift -e '
+import Carbon.HIToolbox
+func property(_ source: TISInputSource, _ key: CFString) -> CFTypeRef? {
+  guard let pointer = TISGetInputSourceProperty(source, key) else { return nil }
+  return Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
+}
+let key = kTISPropertyInputSourceID!
+let filter = [key as String: CommandLine.arguments[1]] as CFDictionary
+let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue()
+let values = list.map { $0 as NSArray } ?? NSArray()
+print("fresh.count=\(values.count)")
+if let raw = values.firstObject {
+  let source = unsafeBitCast(raw as AnyObject, to: TISInputSource.self)
+  print("fresh.enabled=\((property(source, kTISPropertyInputSourceIsEnabled!) as? Bool) ?? false)")
+  print("fresh.selected=\((property(source, kTISPropertyInputSourceIsSelected!) as? Bool) ?? false)")
+}
+let keyboard = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+print("fresh.keyboard=\((property(keyboard, key) as? String) ?? "<unknown>")")
+' "$QWEN_SOURCE_ID"
+```
+
+The pass condition is exactly `fresh.count=1`, `fresh.enabled=true`,
+`fresh.selected=true`, and `fresh.keyboard` equal to
+`$BASELINE_KEYBOARD`. Do not continue into TextEdit/Safari, Accessibility,
+Microphone, or a live provider as part of this probe.
+
+Always roll back, including after a failed stage. First disable only Qwen:
+
+```sh
+swift -e '
+import Carbon.HIToolbox
+let key = kTISPropertyInputSourceID!
+let filter = [key as String: CommandLine.arguments[1]] as CFDictionary
+let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue()
+let values = list.map { $0 as NSArray } ?? NSArray()
+if let raw = values.firstObject {
+  let source = unsafeBitCast(raw as AnyObject, to: TISInputSource.self)
+  print("disable=\(TISDisableInputSource(source))")
+} else {
+  print("disable=not-present")
+}
+' "$QWEN_SOURCE_ID"
+open '/Library/Input Methods'
+```
+
+In Finder, move only the system-level `Qwen Input.app` to Trash and personally
+complete the administrator prompt. Then permanently delete only that probe
+bundle from Trash (not the whole Trash). Restore the exact ordinary keyboard,
+stop only Qwen processes, and remove only the current user's validated runtime
+directory:
+
+```sh
+test ! -e "$SYSTEM_QWEN_BUNDLE"
+swift -e '
+import Carbon.HIToolbox
+import Darwin
+let key = kTISPropertyInputSourceID!
+let filter = [key as String: CommandLine.arguments[1]] as CFDictionary
+guard let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue()
+else { print("restore=missing"); exit(2) }
+let values = list as NSArray
+guard let raw = values.firstObject else { print("restore=missing"); exit(2) }
+let source = unsafeBitCast(raw as AnyObject, to: TISInputSource.self)
+print("restore=\(TISSelectInputSource(source))")
+' "$BASELINE_KEYBOARD"
+pkill -TERM -x 'Qwen Input' 2>/dev/null || true
+pkill -TERM -x QwenInputBridge 2>/dev/null || true
+if [ -d "$RUNTIME_DIR" ]; then
+  test "$(stat -f %u "$RUNTIME_DIR")" = "$(id -u)"
+  test "$(stat -f %Lp "$RUNTIME_DIR")" = 700
+  rm -rf -- "$RUNTIME_DIR"
+fi
+```
+
+Finish with fresh, read-only evidence. The expected output is the original
+keyboard ID, `qwen.count=0`, no bundle paths, no Qwen processes, and no
+runtime directory:
+
+```sh
+swift -e '
+import Carbon.HIToolbox
+func id(_ source: TISInputSource) -> String {
+  let pointer = TISGetInputSourceProperty(source, kTISPropertyInputSourceID!)!
+  return Unmanaged<CFString>.fromOpaque(pointer).takeUnretainedValue() as String
+}
+let keyboard = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+let key = kTISPropertyInputSourceID!
+let filter = [key as String: CommandLine.arguments[1]] as CFDictionary
+let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue()
+let values = list.map { $0 as NSArray } ?? NSArray()
+print("final.keyboard=\(id(keyboard))")
+print("qwen.count=\(values.count)")
+' "$QWEN_SOURCE_ID"
+test "$(swift -e '
+import Carbon.HIToolbox
+let source = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+let pointer = TISGetInputSourceProperty(source, kTISPropertyInputSourceID!)!
+print(Unmanaged<CFString>.fromOpaque(pointer).takeUnretainedValue())
+')" = "$BASELINE_KEYBOARD"
+test ! -e "$SYSTEM_QWEN_BUNDLE"
+test ! -e "$HOME/Library/Input Methods/Qwen Input.app"
+test ! -e "$RUNTIME_DIR"
+! pgrep -x 'Qwen Input'
+! pgrep -x QwenInputBridge
+```
 
 ## Authorization boundary
 
