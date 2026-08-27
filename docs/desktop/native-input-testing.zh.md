@@ -12,15 +12,17 @@ macOS 输入源状态；未经机器所有者明确授权，不得执行人工�
 - 隐藏 palette 的用户级安装/修复、注册、启用、选择、校验和失败回滚：自动化
   已覆盖。当前 macOS 26.5.1 arm64 真机上，per-user Debug/ad-hoc 与 Apple
   Development 签名探针均显示 register/enable 返回成功但状态仍 disabled，select
-  返回 `paramErr`（`-50`）；事务已回滚且普通键盘 source 不变。下一步明确门禁是
-  系统级安装探针，或 Developer ID/公证产物。一次系统级复制已准确触发 macOS
-  `SecurityAgent`，但因自动化不得操作管理员认证界面，在输入凭据前取消并完整
-  清理；下一台 Mac 必须由用户本人完成该单一管理员认证。
+  返回 `paramErr`（`-50`）；事务已回滚且普通键盘 source 不变。历史系统级复制
+  曾触发 macOS `SecurityAgent` 并在输入凭据前取消、清理；该路径现已延后。下一步
+  唯一阻断门禁是下文 Developer ID/公证产物的 per-user release probe。
 - 跨应用 InputMethodKit 真实交互：已用 fake transcript 验证 TextEdit 与
   Safari textarea/contenteditable/password；Terminal 和更广应用矩阵仍未完成。
 - 物理麦克风与 TCC 授权链路：未运行。
 - 基于 Accessibility 的可选 Voice Send：未实现、未授权。
 - Developer ID 签名、公证与 Release Gatekeeper：未运行。
+
+当前下一阻断项是下文可重复的 per-user Release Gate 0。正式签名路径未由一手
+证据否定前，系统级探针保持延后，不得用它跳过 Gate 0。
 
 已安装路径通过仍不等于发布验收。物理麦克风、真实 provider、Terminal、更广
 目标应用、Developer ID 签名和公证仍是后续门禁。自动化生命周期测试不会复制、
@@ -81,12 +83,66 @@ codesign --verify --deep --strict \
 两个原生产物都必须同时包含 `arm64` 与 `x86_64`。本地构建使用 ad-hoc
 签名，只能证明构建和完整性，不能代替正式签名、公证与 Gatekeeper 验收。
 
-## 跨机系统级 hidden-palette 探针
+## 阻断性的 per-user Release Gate 0
+
+只在干净 macOS **标准用户**测试账户执行；完成发行的 Qwen Audio Agent App
+须已复制到 `/Applications`。App、Bridge 与内嵌输入法必须来自同一个
+Developer ID Application 身份并启用 hardened runtime；App 必须有有效 stapled
+公证票据且通过 Gatekeeper。ad-hoc 和 Apple Development 签名会在任何系统状态
+变化前被拒绝。
+
+探针不接受 provider key，也不提供非交互批准参数：
+
+```sh
+git rev-parse HEAD
+npm ci
+npm --silent run native-input:gate0:release -- \
+  --app "/Applications/Qwen Audio Agent.app"
+```
+
+唯一交互提示会说明 macOS 可能把输入法同意作为首次 setup 的系统门禁。只有准备
+好由本人处理 macOS 自有弹窗时才输入 `RUN`。探针绝不自动点击弹窗，不调用私有
+TIS、Accessibility、CGEvent 或 AppleScript，不申请 TCC，也不读取 provider 凭据。
+
+该命令是一个失败关闭的单一阶段机：
+
+1. 校验 macOS、交互式标准用户、精确 Developer ID 身份、hardened runtime、
+   深度签名、公证 staple 与 Gatekeeper；
+2. 记录干净基线：用户/系统 Qwen bundle、Qwen TIS source、Qwen 进程/socket、
+   TextEdit 运行实例均为零，并保存普通键盘 source ID；
+3. 通过发行 Bridge lifecycle 只把内嵌输入法复制到
+   `~/Library/Input Methods`，再用公开 TIS 执行
+   `register → enable → select`；
+4. 由 fresh 公共 TIS 进程要求 hidden palette 恰好一个且
+   `enabled=true / selected=true`，普通键盘 ID 必须逐字不变；
+5. 在真实 TextEdit 打开一个探针自有纯文本文档，等待真实 IMK target，通过
+   Bridge 发送固定、非敏感 fake partial/final，并要求最终文档字节精确等于固定
+   final 文本；
+6. 任一已变更阶段之后都进入 `finally` 清理：取消会话、只 disable Qwen、卸载
+   用户 bundle、必要时恢复基线键盘、只停止 Qwen/探针进程、只删除本轮新增 Qwen
+   废纸篓项及经验证的 runtime/temp 路径，最后用 fresh 进程完整复核基线。
+
+输出是逐行 JSON，只含固定 `stage`、`status`、`reason` 码；不会输出工具 stderr、
+路径、签名主体、fake 文本、环境或协议内容。清理不完整永远以
+`cleanup_incomplete` 作为最终失败；系统状态开始变化后收到 `SIGINT`/`SIGTERM`
+也会进入同一受限清理路径。
+
+Gate 0 只有在发行校验、hidden-palette fresh 状态、普通键盘不变量、真实 TextEdit
+partial/final 与最终清理在同一次执行中全部通过时才通过。本地 Debug/ad-hoc 或
+Apple Development 结果永远不能替代它。若通过，立即停止，不需要特权/系统级
+lifecycle；若失败，只保留固定阶段码与清理证据，正式失败未经复核前不得引入 root
+helper。
+
+## 延后的跨机系统级 hidden-palette 探针
 
 这是可回滚的 OS 可行性探针，不是 Desktop 的 Install/Repair 事务；当前产品
 生命周期仍安装到 `~/Library/Input Methods`。必须使用没有既有 Qwen input
 source、系统级/用户级 Qwen bundle 的测试账户或机器，否则无法证明只清理本轮
 状态。
+
+本节仅保留为历史恢复证据。**在上述 per-user Release Gate 0 使用 Developer ID、
+公证构建得到一手失败并完成复核前，不得执行。** 本节不授权加入 `SMAppService`、
+root helper、密码处理或自动化授权。
 
 从用户 fork 的独立交付分支 checkout，并在完全不注入 provider key 的情况下
 构建：

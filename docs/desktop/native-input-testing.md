@@ -16,16 +16,19 @@ manual matrix without explicit authorization from the machine owner.
   machine, the per-user Debug/ad-hoc and Apple Development-signed probes both
   returned success from register/enable but remained disabled; select returned
   `paramErr` (`-50`). The transaction rolled back and left the keyboard source
-  unchanged. A system-level copy reached the macOS `SecurityAgent` prompt but
-  was cancelled before credentials were entered because automation cannot
-  operate that prompt. A human-authenticated system-level probe or Developer
-  ID/notarized artifact is the next explicit authorization/release gate.
+  unchanged. A historical system-level copy reached the macOS `SecurityAgent`
+  prompt and was cancelled before credentials were entered. That path is now
+  deferred: the next and blocking gate is the Developer ID/notarized per-user
+  release probe below.
 - Cross-application InputMethodKit interaction: verified with fake transcript in
   TextEdit and Safari textarea/contenteditable/password controls. Terminal and
   the broader application matrix remain open.
 - Physical-microphone and TCC interaction: not run.
 - Optional Accessibility-based Voice Send: not implemented or authorized.
 - Developer ID signing, notarization, and release Gatekeeper: not run.
+
+The blocking next step is the repeatable per-user release Gate 0 below. The
+system-level probe is deferred and must not be used to skip Gate 0.
 
 The verified installed path is still not release evidence. Physical microphone,
 real provider, Terminal, broader target applications, Developer ID signing,
@@ -92,13 +95,77 @@ Both native artifacts must contain `arm64` and `x86_64`. Local builds are
 ad-hoc signed and are only build/integrity evidence; they are not notarized
 release evidence.
 
-## Cross-machine system-level palette probe
+## Blocking per-user release Gate 0
+
+Run this probe only on a clean macOS **standard-user** test account with a
+finished Qwen Audio Agent app already copied to `/Applications`. The app, its
+Bridge, and its nested input method must all be signed by one Developer ID
+Application identity with hardened runtime. The app must carry a valid stapled
+notarization ticket and pass Gatekeeper. Ad-hoc and Apple Development signatures
+are rejected before any OS state changes.
+
+The probe intentionally accepts no provider key and no non-interactive approval
+flag:
+
+```sh
+git rev-parse HEAD
+npm ci
+npm --silent run native-input:gate0:release -- \
+  --app "/Applications/Qwen Audio Agent.app"
+```
+
+The one interactive prompt explains that macOS may show input-method consent as
+part of first setup. Type `RUN` only when you are ready to complete any
+macOS-owned dialog yourself. The probe never clicks a dialog, invokes a private
+TIS API, uses Accessibility/CGEvent/AppleScript, requests TCC, or reads a
+provider credential.
+
+The command is a single fail-closed stage machine:
+
+1. verify macOS, an interactive standard user, exact Developer ID identities,
+   hardened runtime, deep code signatures, notarization staple, and Gatekeeper;
+2. capture a clean baseline: no user/system Qwen bundle, Qwen TIS source,
+   Qwen process/socket, or running TextEdit, plus the exact ordinary keyboard
+   source ID;
+3. use the release Bridge lifecycle to copy only the embedded input method to
+   `~/Library/Input Methods`, then run public TIS
+   `register → enable → select`;
+4. use a fresh public-TIS process to require exactly one registered, enabled,
+   selected hidden palette while the ordinary keyboard ID remains byte-for-byte
+   unchanged;
+5. open one probe-owned plain-text document in real TextEdit, wait for a real
+   IMK target, send fixed non-sensitive fake partial/final operations through
+   Bridge, and require the final document bytes to equal the fixed final text;
+6. in a `finally` path after every mutated stage, cancel the session, disable
+   only Qwen, uninstall the user bundle, restore the baseline keyboard if
+   needed, stop only probe-owned/Qwen processes, remove only new Qwen trash and
+   validated runtime/temp paths, then fresh-verify the complete baseline.
+
+Output is newline-delimited JSON containing only fixed `stage`, `status`, and
+`reason` codes. Tool stderr, paths, signing subjects, fake text, environment,
+and protocol contents are never emitted. A failed cleanup is always the
+terminal `cleanup_incomplete` result. `SIGINT`/`SIGTERM` also enter the bounded
+cleanup path once mutation has begun.
+
+Gate 0 passes only if release verification, the hidden-palette fresh state,
+ordinary-keyboard invariant, real TextEdit partial/final, and final cleanup all
+pass in the same run. A local Debug/ad-hoc or Apple Development result can never
+pass this gate. If Gate 0 passes, stop: a privileged/system lifecycle is not
+needed. If it fails, retain the fixed stage result and cleanup evidence; do not
+introduce a root helper until that first-hand release failure is reviewed.
+
+## Deferred cross-machine system-level palette probe
 
 This is a reversible OS-feasibility probe, not the Desktop Install/Repair
 transaction: the current product lifecycle still installs under
 `~/Library/Input Methods`. Use a clean test account or machine. Do not run the
 probe when a Qwen input source or either Qwen bundle path already exists,
 because cleanup must remove only artifacts created by this run.
+
+This section is retained as historical recovery evidence only. **Do not execute
+it before the per-user release Gate 0 above has failed with a Developer ID,
+notarized build and the failure has been reviewed.** It is not permission to add
+`SMAppService`, a root helper, password handling, or automated authorization.
 
 Clone the independent delivery branch and build without any provider key:
 
