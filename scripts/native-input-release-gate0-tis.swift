@@ -1,3 +1,4 @@
+import AppKit
 import Carbon.HIToolbox
 import Darwin
 import Foundation
@@ -79,11 +80,27 @@ private func select(inputSourceID: String) throws {
     }
 }
 
+private func frontmost() throws {
+    guard let application = NSWorkspace.shared.frontmostApplication,
+          let bundleID = application.bundleIdentifier else {
+        throw ProbeError.sourceUnavailable
+    }
+    let result: [String: Any] = [
+        "bundleId": bundleID,
+        "pid": application.processIdentifier,
+    ]
+    let data = try JSONSerialization.data(withJSONObject: result, options: [])
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+}
+
 do {
     guard CommandLine.arguments.count == 3 else {
         throw ProbeError.invalidArguments
     }
     switch CommandLine.arguments[1] {
+    case "frontmost":
+        try frontmost()
     case "snapshot":
         try snapshot(qwenID: CommandLine.arguments[2])
     case "disable":

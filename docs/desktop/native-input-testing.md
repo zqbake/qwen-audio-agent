@@ -97,6 +97,12 @@ release evidence.
 
 ## Blocking per-user release Gate 0
 
+**Current status: BLOCK.** Do not execute the installing/TIS/TextEdit phases until
+this hardened runner has been reviewed and a real Developer ID, notarized,
+stapled release app is available on the clean standard-user machine. Local
+unit/process tests validate the runner only; they are not Gate 0 evidence and
+must not be used to select a privileged lifecycle.
+
 Run this probe only on a clean macOS **standard-user** test account with a
 finished Qwen Audio Agent app already copied to `/Applications`. The app, its
 Bridge, and its nested input method must all be signed by one Developer ID
@@ -114,38 +120,53 @@ npm --silent run native-input:gate0:release -- \
   --app "/Applications/Qwen Audio Agent.app"
 ```
 
-The one interactive prompt explains that macOS may show input-method consent as
-part of first setup. Type `RUN` only when you are ready to complete any
+The one interactive prompt is written to stderr so stdout remains fixed NDJSON.
+It explains that macOS may show input-method consent as part of first setup.
+Type `RUN` only when you are ready to complete any
 macOS-owned dialog yourself. The probe never clicks a dialog, invokes a private
 TIS API, uses Accessibility/CGEvent/AppleScript, requests TCC, or reads a
 provider credential.
 
 The command is a single fail-closed stage machine:
 
-1. verify macOS, an interactive standard user, exact Developer ID identities,
-   hardened runtime, deep code signatures, notarization staple, and Gatekeeper;
-2. capture a clean baseline: no user/system Qwen bundle, Qwen TIS source,
-   Qwen process/socket, or running TextEdit, plus the exact ordinary keyboard
-   source ID;
+1. use absolute Apple tool paths, omit caller `PATH` and unrelated environment
+   values from the Bridge, and verify macOS, enabled Gatekeeper assessments,
+   an interactive non-root/non-admin console user whose home has the same UID,
+   a release tree not owned/writable by the test user, exact Developer ID
+   identities, hardened runtime, deep code signatures,
+   notarization staple, `spctl`, and `syspolicy_check distribution` when the
+   installed SDK supplies it;
+2. capture a clean baseline: no user/system Qwen bundle, lifecycle backup or
+   staging path, Qwen TIS source, Qwen process/socket, or running TextEdit;
+   require the user's Input Methods directory to be safe and Trash to be
+   owned/readable; save the exact ordinary keyboard source ID and Trash entry
+   identities;
 3. use the release Bridge lifecycle to copy only the embedded input method to
    `~/Library/Input Methods`, then run public TIS
    `register → enable → select`;
 4. use a fresh public-TIS process to require exactly one registered, enabled,
    selected hidden palette while the ordinary keyboard ID remains byte-for-byte
    unchanged;
-5. open one probe-owned plain-text document in real TextEdit, wait for a real
-   IMK target, send fixed non-sensitive fake partial/final operations through
-   Bridge, and require the final document bytes to equal the fixed final text;
-6. in a `finally` path after every mutated stage, cancel the session, disable
-   only Qwen, uninstall the user bundle, restore the baseline keyboard if
-   needed, stop only probe-owned/Qwen processes, remove only new Qwen trash and
-   validated runtime/temp paths, then fresh-verify the complete baseline.
+5. open one probe-owned plain-text document in a uniquely identified new
+   TextEdit PID, require that same PID and `com.apple.TextEdit` to be frontmost
+   immediately before and after arm, pin every partial/final/cancel to the
+   returned session/generation/target capability, fail closed on focus change,
+   and require final document bytes to equal the fixed final text;
+6. after every mutated stage, enter one serial bounded cleanup exit. It attempts
+   every cleanup action even after a prior error, then unconditionally performs
+   a fresh verification. It cancels the pinned session, uninstalls through the
+   owned Bridge, disables only Qwen, terminates only the recorded TextEdit PID,
+   removes only paths whose device/inode still matches this run, and accepts a
+   trashed bundle only when its device/inode matches the installed bundle. It
+   never uses global `pkill`, deletes a runtime directory by name, or repairs an
+   ordinary-keyboard change; any such residue/change makes cleanup incomplete.
 
 Output is newline-delimited JSON containing only fixed `stage`, `status`, and
-`reason` codes. Tool stderr, paths, signing subjects, fake text, environment,
-and protocol contents are never emitted. A failed cleanup is always the
-terminal `cleanup_incomplete` result. `SIGINT`/`SIGTERM` also enter the bounded
-cleanup path once mutation has begun.
+`reason` codes, with exactly one terminal `result` event. Tool stderr, paths,
+signing subjects, fake text, environment, and protocol contents are never
+emitted. A failed cleanup is always the terminal `cleanup_incomplete` result.
+`SIGINT`/`SIGTERM` only set the abort state: later mutation is rejected and the
+same awaited cleanup/fresh-verification path finishes before exit 130/143.
 
 Gate 0 passes only if release verification, the hidden-palette fresh state,
 ordinary-keyboard invariant, real TextEdit partial/final, and final cleanup all

@@ -85,6 +85,11 @@ codesign --verify --deep --strict \
 
 ## 阻断性的 per-user Release Gate 0
 
+**当前状态：BLOCK。** 在加固后的 runner 完成复核、且干净标准用户机器上已有真实
+Developer ID 签名、公证并 stapled 的发行 App 前，不得执行安装/TIS/TextEdit 阶段。
+本地单元/进程测试只验证 runner，不能作为 Gate 0 证据，也不能据此选择特权
+lifecycle。
+
 只在干净 macOS **标准用户**测试账户执行；完成发行的 Qwen Audio Agent App
 须已复制到 `/Applications`。App、Bridge 与内嵌输入法必须来自同一个
 Developer ID Application 身份并启用 hardened runtime；App 必须有有效 stapled
@@ -100,32 +105,44 @@ npm --silent run native-input:gate0:release -- \
   --app "/Applications/Qwen Audio Agent.app"
 ```
 
-唯一交互提示会说明 macOS 可能把输入法同意作为首次 setup 的系统门禁。只有准备
+唯一交互提示写入 stderr，stdout 始终保持固定 NDJSON。提示会说明 macOS 可能把
+输入法同意作为首次 setup 的系统门禁。只有准备
 好由本人处理 macOS 自有弹窗时才输入 `RUN`。探针绝不自动点击弹窗，不调用私有
 TIS、Accessibility、CGEvent 或 AppleScript，不申请 TCC，也不读取 provider 凭据。
 
 该命令是一个失败关闭的单一阶段机：
 
-1. 校验 macOS、交互式标准用户、精确 Developer ID 身份、hardened runtime、
-   深度签名、公证 staple 与 Gatekeeper；
-2. 记录干净基线：用户/系统 Qwen bundle、Qwen TIS source、Qwen 进程/socket、
-   TextEdit 运行实例均为零，并保存普通键盘 source ID；
+1. 使用绝对 Apple 工具路径，Bridge 不继承调用方 `PATH` 或无关环境变量；校验
+   macOS、Gatekeeper assessments 已启用、交互式非 root/非 admin console 用户、
+   console UID/euid/home owner 一致、发行树不归测试用户所有且测试用户不可写、精确
+   Developer ID 身份、hardened runtime、
+   深度签名、公证 staple、`spctl`，并在当前 SDK 提供时执行
+   `syspolicy_check distribution`；
+2. 记录干净基线：用户/系统 Qwen bundle、lifecycle backup/staging、Qwen TIS
+   source、Qwen 进程/socket、TextEdit 运行实例均为零；要求 Input Methods 目录
+   安全、Trash 归当前用户且可读写，并保存普通键盘 source ID 与 Trash 条目的
+   device/inode；
 3. 通过发行 Bridge lifecycle 只把内嵌输入法复制到
    `~/Library/Input Methods`，再用公开 TIS 执行
    `register → enable → select`；
 4. 由 fresh 公共 TIS 进程要求 hidden palette 恰好一个且
    `enabled=true / selected=true`，普通键盘 ID 必须逐字不变；
-5. 在真实 TextEdit 打开一个探针自有纯文本文档，等待真实 IMK target，通过
-   Bridge 发送固定、非敏感 fake partial/final，并要求最终文档字节精确等于固定
-   final 文本；
-6. 任一已变更阶段之后都进入 `finally` 清理：取消会话、只 disable Qwen、卸载
-   用户 bundle、必要时恢复基线键盘、只停止 Qwen/探针进程、只删除本轮新增 Qwen
-   废纸篓项及经验证的 runtime/temp 路径，最后用 fresh 进程完整复核基线。
+5. 在唯一识别的新 TextEdit PID 打开探针自有纯文本文档；arm 前后都要求同一 PID
+   与 `com.apple.TextEdit` 位于前台，并把后续 partial/final/cancel 全部钉在 arm
+   返回的 session/generation/target capability；焦点变化立即失败关闭，最终文档
+   字节必须精确等于固定 final 文本；
+6. 任一已变更阶段之后都进入同一个串行、有界清理出口：前一步失败也继续尝试其余
+   清理，最后无条件 fresh verify。它取消 pinned session、经自有 Bridge 卸载、
+   只 disable Qwen、只终止已记录 TextEdit PID，并且只删除 device/inode 仍与本轮
+   一致的路径；Trash 中的 bundle 也必须与已安装 bundle 的 device/inode 一致。
+   禁止全局 `pkill`、按名称删除 runtime，且不“修复”普通键盘变化；任何残留或
+   键盘变化都判定 cleanup incomplete。
 
-输出是逐行 JSON，只含固定 `stage`、`status`、`reason` 码；不会输出工具 stderr、
-路径、签名主体、fake 文本、环境或协议内容。清理不完整永远以
-`cleanup_incomplete` 作为最终失败；系统状态开始变化后收到 `SIGINT`/`SIGTERM`
-也会进入同一受限清理路径。
+输出是逐行 JSON，只含固定 `stage`、`status`、`reason` 码，且只有一个终止
+`result` 事件；不会输出工具 stderr、路径、签名主体、fake 文本、环境或协议内容。
+清理不完整永远以 `cleanup_incomplete` 作为最终失败；`SIGINT`/`SIGTERM` 只设置
+abort 状态，后续 mutation 被拒绝，同一个被 await 的清理/fresh verify 完成后才以
+130/143 退出。
 
 Gate 0 只有在发行校验、hidden-palette fresh 状态、普通键盘不变量、真实 TextEdit
 partial/final 与最终清理在同一次执行中全部通过时才通过。本地 Debug/ad-hoc 或
