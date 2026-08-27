@@ -18,7 +18,6 @@ import { tmpdir, userInfo } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
 
 import { NativeInputHost } from '../desktop/src/native-input-host.mjs'
 import {
@@ -30,7 +29,6 @@ import {
   verifyReleaseArtifact,
 } from './lib/native-input-release-gate0.mjs'
 
-const executeFile = promisify(execFile)
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const tisHelper = resolve(root, 'scripts/native-input-release-gate0-tis.swift')
 const qwenID = 'ai.qwenaudio.agent.inputmethod'
@@ -559,16 +557,79 @@ function writeEvent(output, event) {
   output.write(`${JSON.stringify(value)}\n`)
 }
 
-async function executeSafe(command, args, { signal } = {}) {
+export async function executeSafe(command, args, { signal } = {}) {
   if (!isAbsolute(command)) throw new Gate0ProbeError('untrusted_tool_path')
-  const result = await executeFile(command, args, {
+  const result = await executeFileAfterClose(command, args, {
     encoding: 'utf8',
     env: safeEnvironment,
     killSignal: 'SIGTERM',
     maxBuffer: 1024 * 1024,
-    signal,
-  })
+  }, { signal })
   return { output: `${result.stdout || ''}\n${result.stderr || ''}` }
+}
+
+function executeFileAfterClose(command, args, options, {
+  signal,
+  terminationGraceMs = 250,
+} = {}) {
+  let child
+  let terminationTimer = null
+  let callbackComplete = false
+  let closeComplete = false
+  let callbackError = null
+  let stdout = ''
+  let stderr = ''
+
+  return new Promise((resolveCompletion, rejectCompletion) => {
+    const clearTerminationTimer = () => {
+      if (terminationTimer) clearTimeout(terminationTimer)
+      terminationTimer = null
+    }
+    const removeAbortListener = () => {
+      signal?.removeEventListener('abort', terminateChild)
+    }
+    const settleAfterClose = () => {
+      if (!callbackComplete || !closeComplete) return
+      clearTerminationTimer()
+      removeAbortListener()
+      if (callbackError) {
+        rejectCompletion(callbackError)
+      } else {
+        resolveCompletion({ stderr, stdout })
+      }
+    }
+    const terminateChild = () => {
+      if (closeComplete || child.exitCode !== null || child.signalCode !== null) {
+        return
+      }
+      child.kill('SIGTERM')
+      terminationTimer ??= setTimeout(() => {
+        if (
+          !closeComplete
+          && child.exitCode === null
+          && child.signalCode === null
+        ) {
+          child.kill('SIGKILL')
+        }
+      }, terminationGraceMs)
+      terminationTimer.unref?.()
+    }
+
+    child = execFile(command, args, options, (error, childStdout, childStderr) => {
+      callbackComplete = true
+      callbackError = error
+      stdout = childStdout
+      stderr = childStderr
+      settleAfterClose()
+    })
+    child.once('exit', clearTerminationTimer)
+    child.once('close', () => {
+      closeComplete = true
+      settleAfterClose()
+    })
+    signal?.addEventListener('abort', terminateChild, { once: true })
+    if (signal?.aborted) terminateChild()
+  })
 }
 
 async function snapshotTIS() {

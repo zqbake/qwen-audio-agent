@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 
@@ -24,6 +26,7 @@ import {
   requirePgrepNoMatch,
   runCleanupActions,
 } from '../../scripts/native-input-release-gate0.mjs'
+import * as gate0Runner from '../../scripts/native-input-release-gate0.mjs'
 
 const cleanBaseline = Object.freeze({
   backupBundleExists: false,
@@ -397,6 +400,70 @@ test('a timed-out cleanup action is cancelled and settled before final verify', 
   await new Promise(resolveDelay => setTimeout(resolveDelay, 60))
   assert.equal(verifySawSettled, true)
   assert.equal(lateMutation, false)
+})
+
+test('a timed-out TIS child exits before later cleanup and final verify', {
+  skip: process.platform === 'win32',
+}, async context => {
+  assert.equal(
+    typeof gate0Runner.executeSafe,
+    'function',
+    'the runner must expose its child-settling command wrapper',
+  )
+  const directory = mkdtempSync(join(tmpdir(), 'qwen-g0-child-'))
+  const tracePath = join(directory, 'trace.txt')
+  context.after(() => rmSync(directory, { force: true, recursive: true }))
+  const childProgram = [
+    'const { appendFileSync } = require("node:fs")',
+    'const tracePath = process.argv[1]',
+    'appendFileSync(tracePath, "ready\\n")',
+    'process.on("SIGTERM", () => {',
+    '  appendFileSync(tracePath, "term\\n")',
+    '  setTimeout(() => {',
+    '    appendFileSync(tracePath, "child-exit\\n")',
+    '    process.exit(0)',
+    '  }, 75)',
+    '})',
+    'setInterval(() => {}, 1_000)',
+  ].join('\n')
+  const system = makeSystem({
+    async cleanup() {
+      await runCleanupActions([
+        ['tis-child', signal => gate0Runner.executeSafe(
+          process.execPath,
+          ['-e', childProgram, tracePath],
+          { signal },
+        )],
+        ['next-cleanup', async () => {
+          appendFileSync(tracePath, 'next-cleanup\n')
+        }],
+      ], { timeoutMs: 1_000 })
+    },
+    async verifyCleanup() {
+      appendFileSync(tracePath, 'final-verify\n')
+      return { ...cleanBaseline }
+    },
+  })
+
+  await assert.rejects(
+    captureRun(system),
+    error => error instanceof Gate0ProbeError
+      && error.code === 'cleanup_incomplete',
+  )
+  const childExitDeadline = Date.now() + 2_000
+  let trace
+  do {
+    trace = readFileSync(tracePath, 'utf8').trim().split('\n')
+    if (trace.includes('child-exit')) break
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 20))
+  } while (Date.now() < childExitDeadline)
+  assert.deepEqual(trace, [
+    'ready',
+    'term',
+    'child-exit',
+    'next-cleanup',
+    'final-verify',
+  ])
 })
 
 test('a timed-out Bridge request stops the child and awaits exit before continuing', async () => {
