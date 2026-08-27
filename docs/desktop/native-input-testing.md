@@ -97,11 +97,12 @@ release evidence.
 
 ## Blocking per-user release Gate 0
 
-**Current status: BLOCK.** Do not execute the installing/TIS/TextEdit phases until
-this hardened runner has been reviewed and a real Developer ID, notarized,
-stapled release app is available on the clean standard-user machine. Local
-unit/process tests validate the runner only; they are not Gate 0 evidence and
-must not be used to select a privileged lifecycle.
+**Current status: BLOCKED ON RELEASE ENVIRONMENT.** The hardened runner is ready
+for the formal probe, but do not execute the installing/TIS/TextEdit phases
+until a real Developer ID, notarized, stapled release app is available on a
+clean standard-user machine. Local unit/process tests validate the runner only;
+they are not Gate 0 evidence and must not be used to select a privileged
+lifecycle.
 
 Run this probe only on a clean macOS **standard-user** test account with a
 finished Qwen Audio Agent app already copied to `/Applications`. The app, its
@@ -129,9 +130,11 @@ provider credential.
 
 The command is a single fail-closed stage machine:
 
-1. use absolute Apple tool paths, omit caller `PATH` and unrelated environment
-   values from the Bridge, and verify macOS, enabled Gatekeeper assessments,
-   an interactive non-root/non-admin console user whose home has the same UID,
+1. use absolute Apple tool paths, derive every user path and the Bridge `HOME`
+   from the system account database, reject an alternate caller `HOME`, omit
+   caller `PATH` and unrelated environment values from the Bridge, and verify
+   macOS, enabled Gatekeeper assessments, an interactive non-root/non-admin
+   console user whose canonical home has the same UID,
    a release tree not owned/writable by the test user, exact Developer ID
    identities, hardened runtime, deep code signatures,
    notarization staple, `spctl`, and `syspolicy_check distribution` when the
@@ -147,14 +150,19 @@ The command is a single fail-closed stage machine:
 4. use a fresh public-TIS process to require exactly one registered, enabled,
    selected hidden palette while the ordinary keyboard ID remains byte-for-byte
    unchanged;
-5. open one probe-owned plain-text document in a uniquely identified new
-   TextEdit PID, require that same PID and `com.apple.TextEdit` to be frontmost
-   immediately before and after arm, pin every partial/final/cancel to the
-   returned session/generation/target capability, fail closed on focus change,
-   and require final document bytes to equal the fixed final text;
-6. after every mutated stage, enter one serial bounded cleanup exit. It attempts
-   every cleanup action even after a prior error, then unconditionally performs
-   a fresh verification. It cancels the pinned session, uninstalls through the
+5. open one probe-owned plain-text document and retain the uniquely identified
+   new TextEdit PID only for run-owned cleanup. For text targeting, use the
+   Soink-aligned model: trust the macOS IMK client handoff, require an observable
+   focus transition into the test client and no observable focus change across
+   arm/partial/final, pin every partial/final/cancel to the returned
+   session/generation/target capability, and require final document bytes to
+   equal the fixed final text. App PID/document ownership is not a P0 target
+   proof and is not inferred from the final byte check;
+6. after every mutated stage, enter one serial bounded cleanup exit. A timed-out
+   action is actively cancelled and its child/Bridge request is confirmed
+   settled before the next action or final verification. Cleanup attempts every
+   action even after a prior error, then unconditionally performs a fresh
+   verification. It cancels the pinned session, uninstalls through the
    owned Bridge, disables only Qwen, terminates only the recorded TextEdit PID,
    removes only paths whose device/inode still matches this run, and accepts a
    trashed bundle only when its device/inode matches the installed bundle. It
@@ -174,6 +182,12 @@ pass in the same run. A local Debug/ad-hoc or Apple Development result can never
 pass this gate. If Gate 0 passes, stop: a privileged/system lifecycle is not
 needed. If it fails, retain the fixed stage result and cleanup evidence; do not
 introduce a root helper until that first-hand release failure is reviewed.
+
+This P0 deliberately follows macOS IMK client handoff rather than claiming an
+application-level PID/control ownership proof. Session/generation/target,
+secure/status gates, and observable focus-change rejection remain mandatory,
+but this mode does not claim provable zero-miswrite under every unobservable OS
+client race.
 
 ## Deferred cross-machine system-level palette probe
 

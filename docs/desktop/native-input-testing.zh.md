@@ -85,10 +85,10 @@ codesign --verify --deep --strict \
 
 ## 阻断性的 per-user Release Gate 0
 
-**当前状态：BLOCK。** 在加固后的 runner 完成复核、且干净标准用户机器上已有真实
-Developer ID 签名、公证并 stapled 的发行 App 前，不得执行安装/TIS/TextEdit 阶段。
-本地单元/进程测试只验证 runner，不能作为 Gate 0 证据，也不能据此选择特权
-lifecycle。
+**当前状态：因发行环境而 BLOCK。** 加固后的 runner 已可用于正式探针，但在干净
+标准用户机器上具备真实 Developer ID 签名、公证并 stapled 的发行 App 前，不得
+执行安装/TIS/TextEdit 阶段。本地单元/进程测试只验证 runner，不能作为 Gate 0
+证据，也不能据此选择特权 lifecycle。
 
 只在干净 macOS **标准用户**测试账户执行；完成发行的 Qwen Audio Agent App
 须已复制到 `/Applications`。App、Bridge 与内嵌输入法必须来自同一个
@@ -112,9 +112,11 @@ TIS、Accessibility、CGEvent 或 AppleScript，不申请 TCC，也不读取 pro
 
 该命令是一个失败关闭的单一阶段机：
 
-1. 使用绝对 Apple 工具路径，Bridge 不继承调用方 `PATH` 或无关环境变量；校验
-   macOS、Gatekeeper assessments 已启用、交互式非 root/非 admin console 用户、
-   console UID/euid/home owner 一致、发行树不归测试用户所有且测试用户不可写、精确
+1. 使用绝对 Apple 工具路径；所有用户路径和 Bridge `HOME` 都从系统账户数据库的
+   canonical home 派生，拒绝替代 caller `HOME`；Bridge 不继承调用方 `PATH` 或
+   无关环境变量；校验 macOS、Gatekeeper assessments 已启用、交互式非 root/非
+   admin console 用户、console UID/euid/canonical-home owner 一致、发行树不归测试
+   用户所有且测试用户不可写、精确
    Developer ID 身份、hardened runtime、
    深度签名、公证 staple、`spctl`，并在当前 SDK 提供时执行
    `syspolicy_check distribution`；
@@ -127,12 +129,16 @@ TIS、Accessibility、CGEvent 或 AppleScript，不申请 TCC，也不读取 pro
    `register → enable → select`；
 4. 由 fresh 公共 TIS 进程要求 hidden palette 恰好一个且
    `enabled=true / selected=true`，普通键盘 ID 必须逐字不变；
-5. 在唯一识别的新 TextEdit PID 打开探针自有纯文本文档；arm 前后都要求同一 PID
-   与 `com.apple.TextEdit` 位于前台，并把后续 partial/final/cancel 全部钉在 arm
-   返回的 session/generation/target capability；焦点变化立即失败关闭，最终文档
-   字节必须精确等于固定 final 文本；
-6. 任一已变更阶段之后都进入同一个串行、有界清理出口：前一步失败也继续尝试其余
-   清理，最后无条件 fresh verify。它取消 pinned session、经自有 Bridge 卸载、
+5. 打开探针自有纯文本文档；唯一识别的新 TextEdit PID 只用于清理本轮启动的进程。
+   正文 target 采用 Soink 对齐模型：信任 macOS IMK client 交接，要求进入测试
+   client 时出现可观察焦点变化，且 arm/partial/final 期间可观察焦点不得变化；把
+   partial/final/cancel 全部钉在 arm 返回的 session/generation/target capability，
+   最终文档字节必须精确等于固定 final 文本。App PID/文档 ownership 不再作为 P0
+   target 证明，也不能从最终字节检查反推；
+6. 任一已变更阶段之后都进入同一个串行、有界清理出口：超时动作会被真实取消，且
+   必须确认 child/Bridge request 已 settled，才能进入下一动作或 final verify；前一
+   步失败也继续尝试其余清理，最后无条件 fresh verify。它取消 pinned session、经
+   自有 Bridge 卸载、
    只 disable Qwen、只终止已记录 TextEdit PID，并且只删除 device/inode 仍与本轮
    一致的路径；Trash 中的 bundle 也必须与已安装 bundle 的 device/inode 一致。
    禁止全局 `pkill`、按名称删除 runtime，且不“修复”普通键盘变化；任何残留或
@@ -149,6 +155,10 @@ partial/final 与最终清理在同一次执行中全部通过时才通过。本
 Apple Development 结果永远不能替代它。若通过，立即停止，不需要特权/系统级
 lifecycle；若失败，只保留固定阶段码与清理证据，正式失败未经复核前不得引入 root
 helper。
+
+该 P0 明确采用 macOS IMK client 交接，不宣称应用层 PID/控件 ownership 证明。
+session/generation/target、secure/status 门和可观察焦点变化拒绝仍是必需项；但对于
+操作系统内部不可观察的 client 竞态，此模式不承诺可证明的绝对零误写。
 
 ## 延后的跨机系统级 hidden-palette 探针
 

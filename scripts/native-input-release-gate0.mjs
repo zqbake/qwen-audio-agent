@@ -14,7 +14,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir, userInfo } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
@@ -34,18 +34,44 @@ const executeFile = promisify(execFile)
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const tisHelper = resolve(root, 'scripts/native-input-release-gate0-tis.swift')
 const qwenID = 'ai.qwenaudio.agent.inputmethod'
-const userBundle = join(homedir(), 'Library/Input Methods/Qwen Input.app')
-const inputMethodsDirectory = dirname(userBundle)
-const backupBundle = join(inputMethodsDirectory, '.qwen-input-last-known-good')
+const account = userInfo()
+const canonicalHome = realpathSync(account.homedir)
+const {
+  backupBundle,
+  inputMethodsDirectory,
+  trashDirectory,
+  userBundle,
+} = gate0UserPaths(canonicalHome)
 const systemBundle = '/Library/Input Methods/Qwen Input.app'
 const runtimeDirectory = join(tmpdir(), `qwen-ni-${process.getuid?.() ?? 0}`)
-const trashDirectory = join(homedir(), '.Trash')
-const safeEnvironment = gate0ChildEnvironment(process.env)
+const safeEnvironment = gate0ChildEnvironment({
+  ...process.env,
+  HOME: canonicalHome,
+}, canonicalHome)
 
-export function gate0ChildEnvironment(environment = {}) {
+export function gate0UserPaths(homeDirectory) {
+  const inputMethodsDirectory = join(homeDirectory, 'Library/Input Methods')
+  return {
+    backupBundle: join(inputMethodsDirectory, '.qwen-input-last-known-good'),
+    inputMethodsDirectory,
+    trashDirectory: join(homeDirectory, '.Trash'),
+    userBundle: join(inputMethodsDirectory, 'Qwen Input.app'),
+  }
+}
+
+export function gate0ChildEnvironment(environment = {}, accountHome = null) {
+  if (
+    accountHome
+    && environment.HOME
+    && realpathIfPresent(environment.HOME) !== realpathIfPresent(accountHome)
+  ) {
+    throw new Gate0ProbeError('caller_home_mismatch')
+  }
   return Object.fromEntries([
     'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR',
-  ].flatMap(key => environment[key] ? [[key, environment[key]]] : []))
+  ].flatMap(key => environment[key] ? [[key, environment[key]]] : []).concat(
+    accountHome ? [['HOME', accountHome]] : [],
+  ))
 }
 
 export function assertTrustedArtifactMetadata(
@@ -65,13 +91,15 @@ export function assertTrustedArtifactMetadata(
   return { dev: metadata.dev, ino: metadata.ino }
 }
 
-export function assertTextEditTarget({ after, armed, before, launchedPID }) {
-  const textEdit = value => value?.bundleId === 'com.apple.TextEdit'
+export function assertIMKClientHandoff({ after, armed, before }) {
+  const observable = value => typeof value?.bundleId === 'string'
+    && value.bundleId.length > 0
     && Number.isInteger(value.pid)
-    && value.pid === launchedPID
   if (
-    !textEdit(before)
-    || !textEdit(after)
+    !observable(before)
+    || !observable(after)
+    || before.bundleId !== after.bundleId
+    || before.pid !== after.pid
     || armed?.accepted !== true
     || typeof armed.sessionId !== 'string'
     || !armed.sessionId
@@ -79,12 +107,24 @@ export function assertTextEditTarget({ after, armed, before, launchedPID }) {
     || typeof armed.targetId !== 'string'
     || !armed.targetId
   ) {
-    throw new Gate0ProbeError('textedit_target_unproven')
+    throw new Gate0ProbeError('imk_client_unproven')
   }
   return {
     generation: armed.generation,
     sessionId: armed.sessionId,
     targetId: armed.targetId,
+  }
+}
+
+export function assertObservedFocusUnchanged(expected, current) {
+  if (
+    typeof expected?.bundleId !== 'string'
+    || !expected.bundleId
+    || !Number.isInteger(expected.pid)
+    || expected.bundleId !== current?.bundleId
+    || expected.pid !== current?.pid
+  ) {
+    throw new Gate0ProbeError('observed_focus_changed')
   }
 }
 
@@ -104,10 +144,19 @@ export function matchOwnedTrashItem({ after, before, installedIdentity }) {
 export async function runCleanupActions(actions, { timeoutMs = 10_000 } = {}) {
   const failures = []
   for (const [name, action] of actions) {
+    const controller = new AbortController()
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort(new Gate0ProbeError('cleanup_timeout'))
+    }, timeoutMs)
     try {
-      await withTimeout(action(), timeoutMs)
+      await action(controller.signal)
+      if (timedOut) failures.push(name)
     } catch {
       failures.push(name)
+    } finally {
+      clearTimeout(timer)
     }
   }
   if (failures.length > 0) throw new Gate0ProbeError('cleanup_failed')
@@ -136,6 +185,7 @@ export class LocalMacGate0System {
     this.probeIdentity = null
     this.startedTextEdit = null
     this.targetCapability = null
+    this.observedFocus = null
     this.trashBefore = new Map()
     this.ownedTrashItem = null
   }
@@ -144,11 +194,12 @@ export class LocalMacGate0System {
     if (process.platform !== 'darwin') {
       throw new Gate0ProbeError('macos_required')
     }
+    gate0ChildEnvironment(process.env, canonicalHome)
     assertGate0Host({
       consoleUid: lstatSync('/dev/console').uid,
       euid: process.geteuid?.(),
       groups: process.getgroups?.() ?? [],
-      homeUid: lstatSync(homedir()).uid,
+      homeUid: lstatSync(canonicalHome).uid,
       platform: process.platform,
     })
     if (!this.input.isTTY) {
@@ -209,25 +260,29 @@ export class LocalMacGate0System {
     if ((await processIDs('TextEdit')).length !== 0) {
       throw new Gate0ProbeError('textedit_ownership_unproven')
     }
+    const previousFocus = await snapshotFrontmost()
     await executeSafe(SYSTEM_TOOL_PATHS.open, [
       '-n', '-a', 'TextEdit', documentPath,
     ])
     const textEditPID = await waitForSingleProcess('TextEdit')
     this.startedTextEdit = await captureProcessIdentity(textEditPID)
-    const before = await waitForFrontmostTextEdit(textEditPID)
+    const before = await waitForObservedFocusChange(previousFocus)
 
     const host = this.ensureHost()
     host.requestTimeoutMs = 5_000
     const armed = await waitForArm(host)
     const after = await snapshotFrontmost()
-    this.targetCapability = assertTextEditTarget({
+    this.targetCapability = assertIMKClientHandoff({
       after,
       armed,
       before,
-      launchedPID: textEditPID,
     })
+    this.observedFocus = before
     assertNotAborted(this.abortSignal)
-    await assertFrontmostTextEdit(textEditPID)
+    assertObservedFocusUnchanged(
+      this.observedFocus,
+      await snapshotFrontmost(),
+    )
     const partial = await host.request({
       ...this.targetCapability,
       type: 'session.partial',
@@ -240,7 +295,10 @@ export class LocalMacGate0System {
       return { partialAccepted: false, finalAccepted: false }
     }
     assertNotAborted(this.abortSignal)
-    await assertFrontmostTextEdit(textEditPID)
+    assertObservedFocusUnchanged(
+      this.observedFocus,
+      await snapshotFrontmost(),
+    )
     const final = await host.request({
       ...this.targetCapability,
       type: 'session.final',
@@ -254,6 +312,7 @@ export class LocalMacGate0System {
       : ''
     await cancelSession(host, this.targetCapability)
     this.targetCapability = null
+    this.observedFocus = null
     return {
       documentText,
       finalAccepted: final?.accepted === true,
@@ -271,10 +330,14 @@ export class LocalMacGate0System {
     if (!this.mutationStarted) return
     if (this.host) this.host.requestTimeoutMs = 8_000
     await runCleanupActions([
-      ['cancel', () => cancelSession(this.host, this.targetCapability)],
-      ['uninstall', () => this.uninstallOwnedBundle()],
-      ['stop-bridge', () => this.stopHost()],
-      ['disable-palette', () => runTIS('disable', qwenID)],
+      ['cancel', signal => cancelSession(
+        this.host,
+        this.targetCapability,
+        { signal },
+      )],
+      ['uninstall', signal => this.uninstallOwnedBundle(signal)],
+      ['stop-bridge', signal => this.stopHost(signal)],
+      ['disable-palette', signal => runTIS('disable', qwenID, { signal })],
       ['terminate-textedit', () => this.terminateOwnedTextEdit()],
       ['remove-probe', () => this.removeOwnedProbe()],
       ['remove-trash', () => this.removeOwnedTrashItem()],
@@ -336,7 +399,7 @@ export class LocalMacGate0System {
     }
   }
 
-  async uninstallOwnedBundle() {
+  async uninstallOwnedBundle(signal) {
     if (!this.installedIdentity && pathExists(userBundle)) {
       this.installedIdentity = ownedIdentity(userBundle)
     }
@@ -347,7 +410,11 @@ export class LocalMacGate0System {
     if (!this.host || this.host.state !== 'ready') {
       throw new Gate0ProbeError('bridge_unavailable_for_uninstall')
     }
-    const result = await this.host.request({ type: 'lifecycle.uninstall' })
+    const result = await requestHostWithCancellation(
+      this.host,
+      { type: 'lifecycle.uninstall' },
+      signal,
+    )
     if (result?.accepted !== true || result.installed !== false) {
       throw new Gate0ProbeError('uninstall_failed')
     }
@@ -362,11 +429,15 @@ export class LocalMacGate0System {
     }
   }
 
-  async stopHost() {
+  async stopHost(signal) {
     if (!this.host) return
+    const host = this.host
+    const abort = () => host.emergencyStop('gate0_cleanup_timeout')
+    signal?.addEventListener('abort', abort, { once: true })
     try {
-      await this.host.stop('gate0_cleanup')
+      await host.stop('gate0_cleanup')
     } finally {
+      signal?.removeEventListener('abort', abort)
       this.host = null
     }
   }
@@ -488,12 +559,14 @@ function writeEvent(output, event) {
   output.write(`${JSON.stringify(value)}\n`)
 }
 
-async function executeSafe(command, args) {
+async function executeSafe(command, args, { signal } = {}) {
   if (!isAbsolute(command)) throw new Gate0ProbeError('untrusted_tool_path')
   const result = await executeFile(command, args, {
     encoding: 'utf8',
     env: safeEnvironment,
+    killSignal: 'SIGTERM',
     maxBuffer: 1024 * 1024,
+    signal,
   })
   return { output: `${result.stdout || ''}\n${result.stderr || ''}` }
 }
@@ -513,10 +586,10 @@ async function snapshotTIS() {
   }
 }
 
-function runTIS(action, value) {
+function runTIS(action, value, { signal } = {}) {
   return executeSafe(SYSTEM_TOOL_PATHS.xcrun, [
     'swift', tisHelper, action, value,
-  ])
+  ], { signal })
 }
 
 async function waitForArm(host) {
@@ -531,18 +604,33 @@ async function waitForArm(host) {
     } catch {}
     await delay(250)
   }
-  throw new Gate0ProbeError('textedit_target_unproven')
+  throw new Gate0ProbeError('imk_client_unproven')
 }
 
-async function cancelSession(host, capability = null) {
+async function cancelSession(host, capability = null, { signal } = {}) {
   if (!host || host.state !== 'ready' || !capability) return
-  const result = await host.request({
+  const result = await requestHostWithCancellation(host, {
     ...(capability || {}),
     reason: 'gate0_cleanup',
     statusVisible: true,
     type: 'session.cancel',
-  })
+  }, signal)
   if (result?.accepted !== true) throw new Gate0ProbeError('cancel_failed')
+}
+
+export async function requestHostWithCancellation(host, message, signal) {
+  let stopPromise = null
+  const abort = () => {
+    stopPromise ??= host.stop('gate0_cleanup_timeout')
+  }
+  signal?.addEventListener('abort', abort, { once: true })
+  if (signal?.aborted) abort()
+  try {
+    return await host.request(message)
+  } finally {
+    signal?.removeEventListener('abort', abort)
+    if (stopPromise) await stopPromise
+  }
 }
 
 async function waitForDocument(path, expected) {
@@ -723,21 +811,21 @@ async function snapshotFrontmost() {
   }
 }
 
-async function waitForFrontmostTextEdit(pid) {
+async function waitForObservedFocusChange(previous) {
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {
     const value = await snapshotFrontmost()
-    if (value.bundleId === 'com.apple.TextEdit' && value.pid === pid) return value
+    if (
+      typeof value.bundleId === 'string'
+      && value.bundleId
+      && Number.isInteger(value.pid)
+      && (value.bundleId !== previous?.bundleId || value.pid !== previous?.pid)
+    ) {
+      return value
+    }
     await delay(100)
   }
-  throw new Gate0ProbeError('textedit_target_unproven')
-}
-
-async function assertFrontmostTextEdit(pid) {
-  const value = await snapshotFrontmost()
-  if (value.bundleId !== 'com.apple.TextEdit' || value.pid !== pid) {
-    throw new Gate0ProbeError('textedit_target_changed')
-  }
+  throw new Gate0ProbeError('imk_client_unproven')
 }
 
 function realpathIfPresent(path) {
@@ -769,23 +857,6 @@ function sameDirectorySnapshot(left, right) {
     if (!sameIdentity(identity, right.get(name))) return false
   }
   return true
-}
-
-async function withTimeout(promise, milliseconds) {
-  let timer
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, rejectTimeout) => {
-        timer = setTimeout(
-          () => rejectTimeout(new Gate0ProbeError('cleanup_timeout')),
-          milliseconds,
-        )
-      }),
-    ])
-  } finally {
-    clearTimeout(timer)
-  }
 }
 
 if (

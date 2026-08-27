@@ -49,6 +49,15 @@ test('a non-console user is rejected before any mutation', () => {
   })
 })
 
+test('an alternate caller HOME is rejected before any mutation', () => {
+  const result = runScenario('alternate-home')
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(parseNDJSON(result.stdout), [
+    { reason: 'caller_home_mismatch', stage: 'host', status: 'fail' },
+    { reason: 'caller_home_mismatch', stage: 'result', status: 'fail' },
+  ])
+})
+
 test('cleanup failure still emits one terminal result and no raw error', () => {
   const result = runScenario('cleanup-failure')
   assert.equal(result.status, 1, result.stderr)

@@ -2,7 +2,10 @@ import {
   assertGate0Host,
   verifyReleaseArtifact,
 } from '../../../scripts/lib/native-input-release-gate0.mjs'
-import { runGate0Command } from '../../../scripts/native-input-release-gate0.mjs'
+import {
+  gate0ChildEnvironment,
+  runGate0Command,
+} from '../../../scripts/native-input-release-gate0.mjs'
 
 const clean = {
   backupBundleExists: false,
@@ -36,6 +39,12 @@ function makeSystem(scenario) {
   }
   const system = {
     async assertSupportedHost() {
+      if (scenario === 'alternate-home') {
+        gate0ChildEnvironment(
+          { HOME: '/Users/same-uid-alternate' },
+          '/Users/canonical-account',
+        )
+      }
       if (scenario === 'root') {
         assertGate0Host({
           consoleUid: 0,

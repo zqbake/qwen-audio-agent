@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 
 import {
@@ -14,10 +14,13 @@ import {
   verifyReleaseArtifact,
 } from '../../scripts/lib/native-input-release-gate0.mjs'
 import {
+  assertIMKClientHandoff,
+  assertObservedFocusUnchanged,
   assertTrustedArtifactMetadata,
-  assertTextEditTarget,
   gate0ChildEnvironment,
+  gate0UserPaths,
   matchOwnedTrashItem,
+  requestHostWithCancellation,
   requirePgrepNoMatch,
   runCleanupActions,
 } from '../../scripts/native-input-release-gate0.mjs'
@@ -229,6 +232,30 @@ test('the Bridge environment never inherits caller PATH or unrelated values', ()
   })
 })
 
+test('every user path and child HOME use the canonical account home', () => {
+  const home = resolve('test-canonical-home')
+  const inputMethodsDirectory = join(home, 'Library', 'Input Methods')
+  assert.deepEqual(gate0UserPaths(home), {
+    backupBundle: join(inputMethodsDirectory, '.qwen-input-last-known-good'),
+    inputMethodsDirectory,
+    trashDirectory: join(home, '.Trash'),
+    userBundle: join(inputMethodsDirectory, 'Qwen Input.app'),
+  })
+  assert.deepEqual(gate0ChildEnvironment({
+    HOME: '/Users/canonical',
+    LANG: 'en_US.UTF-8',
+    PATH: '/malicious/bin',
+  }, '/Users/canonical'), {
+    HOME: '/Users/canonical',
+    LANG: 'en_US.UTF-8',
+  })
+  assert.throws(
+    () => gate0ChildEnvironment({ HOME: '/Users/alternate' }, '/Users/canonical'),
+    error => error instanceof Gate0ProbeError
+      && error.code === 'caller_home_mismatch',
+  )
+})
+
 test('the release app and Bridge must not be test-user-owned or writable', () => {
   assert.deepEqual(assertTrustedArtifactMetadata({
     dev: 1,
@@ -250,44 +277,52 @@ test('the release app and Bridge must not be test-user-owned or writable', () =>
   }
 })
 
-test('TextEdit target attestation pins one process and one IMK capability', () => {
-  assert.deepEqual(assertTextEditTarget({
-    after: { bundleId: 'com.apple.TextEdit', pid: 912 },
-    armed: {
-      accepted: true,
-      generation: 7,
-      sessionId: 'session-1',
-      targetId: 'target-1',
-    },
-    before: { bundleId: 'com.apple.TextEdit', pid: 912 },
-    launchedPID: 912,
+test('Soink-aligned target trust accepts a stable IMK client handoff without App identity proof', () => {
+  const armed = {
+    accepted: true,
+    generation: 7,
+    sessionId: 'session-1',
+    targetId: 'target-1',
+  }
+  assert.deepEqual(assertIMKClientHandoff({
+    after: { bundleId: 'com.apple.Safari', pid: 733 },
+    armed,
+    before: { bundleId: 'com.apple.Safari', pid: 733 },
   }), {
     generation: 7,
     sessionId: 'session-1',
     targetId: 'target-1',
   })
-  for (const candidate of [
-    { after: { bundleId: 'com.apple.TextEdit', pid: 913 } },
-    { after: { bundleId: 'com.apple.Safari', pid: 912 } },
-    { armed: { accepted: true, generation: 7, sessionId: '', targetId: '' } },
-  ]) {
-    assert.throws(
-      () => assertTextEditTarget({
-        after: { bundleId: 'com.apple.TextEdit', pid: 912 },
-        armed: {
-          accepted: true,
-          generation: 7,
-          sessionId: 'session-1',
-          targetId: 'target-1',
-        },
-        before: { bundleId: 'com.apple.TextEdit', pid: 912 },
-        launchedPID: 912,
-        ...candidate,
-      }),
-      error => error instanceof Gate0ProbeError
-        && error.code === 'textedit_target_unproven',
-    )
-  }
+  assert.throws(
+    () => assertIMKClientHandoff({
+      after: { bundleId: 'com.apple.Terminal', pid: 744 },
+      armed,
+      before: { bundleId: 'com.apple.Safari', pid: 733 },
+    }),
+    error => error instanceof Gate0ProbeError
+      && error.code === 'imk_client_unproven',
+  )
+  assert.doesNotThrow(() => assertObservedFocusUnchanged(
+    { bundleId: 'com.apple.Safari', pid: 733 },
+    { bundleId: 'com.apple.Safari', pid: 733 },
+  ))
+  assert.throws(
+    () => assertObservedFocusUnchanged(
+      { bundleId: 'com.apple.Safari', pid: 733 },
+      { bundleId: 'com.apple.Terminal', pid: 744 },
+    ),
+    error => error instanceof Gate0ProbeError
+      && error.code === 'observed_focus_changed',
+  )
+  assert.throws(
+    () => assertIMKClientHandoff({
+      after: { bundleId: 'com.apple.Safari', pid: 733 },
+      armed: { accepted: true, generation: 7, sessionId: '', targetId: '' },
+      before: { bundleId: 'com.apple.Safari', pid: 733 },
+    }),
+    error => error instanceof Gate0ProbeError
+      && error.code === 'imk_client_unproven',
+  )
 })
 
 test('trash cleanup ownership requires one new entry with the installed inode', () => {
@@ -327,6 +362,84 @@ test('bounded cleanup remains serial and attempts every action after failures', 
     )
     assert.deepEqual(calls, names)
   }
+})
+
+test('a timed-out cleanup action is cancelled and settled before final verify', async () => {
+  let lateMutation = false
+  let settled = false
+  let verifySawSettled = false
+  const system = makeSystem({
+    async cleanup() {
+      await runCleanupActions([['slow-mutation', signal => new Promise(resolve => {
+        const timer = setTimeout(() => {
+          lateMutation = true
+          settled = true
+          resolve()
+        }, 40)
+        signal?.addEventListener('abort', () => {
+          clearTimeout(timer)
+          settled = true
+          resolve()
+        }, { once: true })
+      })]], { timeoutMs: 5 })
+    },
+    async verifyCleanup() {
+      verifySawSettled = settled
+      return { ...cleanBaseline }
+    },
+  })
+
+  await assert.rejects(
+    captureRun(system),
+    error => error instanceof Gate0ProbeError
+      && error.code === 'cleanup_incomplete',
+  )
+  await new Promise(resolveDelay => setTimeout(resolveDelay, 60))
+  assert.equal(verifySawSettled, true)
+  assert.equal(lateMutation, false)
+})
+
+test('a timed-out Bridge request stops the child and awaits exit before continuing', async () => {
+  const calls = []
+  let rejectRequest
+  const host = {
+    request() {
+      calls.push('request')
+      return new Promise((resolve, reject) => {
+        void resolve
+        rejectRequest = () => {
+          calls.push('request-cancelled')
+          reject(new Error('stopped'))
+        }
+      })
+    },
+    async stop() {
+      calls.push('stop-start')
+      rejectRequest()
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 10))
+      calls.push('stop-settled')
+    },
+  }
+
+  await assert.rejects(
+    runCleanupActions([
+      ['host-request', signal => requestHostWithCancellation(
+        host,
+        { type: 'lifecycle.uninstall' },
+        signal,
+      )],
+      ['next', async () => { calls.push('next') }],
+    ], { timeoutMs: 5 }),
+    error => error instanceof Gate0ProbeError
+      && error.code === 'cleanup_failed',
+  )
+  assert.deepEqual(calls, [
+    'request',
+    'stop-start',
+    'request-cancelled',
+    'stop-settled',
+    'next',
+  ])
 })
 
 test('pgrep exit 1 means no match but tool failures fail closed', () => {
