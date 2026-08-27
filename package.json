@@ -159,6 +159,7 @@
     "native-input:build": "node scripts/build-native-input.mjs --configuration Debug --arch current --output dist/native-input",
     "native-input:build:release": "node scripts/build-native-input.mjs --configuration Release --arch universal --output dist/native-input",
     "native-input:gate0:release": "node scripts/native-input-release-gate0.mjs",
+    "native-input:test:full": "node scripts/native-input-full-flow.mjs",
     "cli": "npm run start --workspace @qwen-audio-agent/cli --",
     "tui": "npm run start --workspace tui --",
     "backend": "node scripts/start.mjs",

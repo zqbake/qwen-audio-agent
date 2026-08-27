@@ -24,7 +24,9 @@ manual matrix without explicit authorization from the machine owner.
   TextEdit and Safari textarea/contenteditable/password controls. Terminal and
   the broader application matrix remain open.
 - Physical-microphone and TCC interaction: not run.
-- Optional Accessibility-based Voice Send: not implemented or authorized.
+- Optional Accessibility-based Voice Send and latest-owned-text corrections:
+  implemented behind an explicit default-off setting and covered by automated
+  tests; real TCC authorization and live validation have not been run.
 - Developer ID signing, notarization, and release Gatekeeper: not run.
 
 The blocking next step is the repeatable per-user release Gate 0 below. The
@@ -94,6 +96,39 @@ codesign --verify --deep --strict \
 Both native artifacts must contain `arm64` and `x86_64`. Local builds are
 ad-hoc signed and are only build/integrity evidence; they are not notarized
 release evidence.
+
+## Automated full-flow developer gate
+
+Run the complete non-installing developer flow with one command:
+
+```sh
+npm run native-input:test:full
+```
+
+It serially runs native tests, all repository tests, lint, the web build, a
+universal native Release build, architecture and exact-identifier code-sign
+checks, an ad-hoc Desktop DMG build in a run-owned temporary directory, packaged
+App/Bridge/IME signature and architecture checks, DMG verification, and the
+Desktop smoke test. The temporary package directory is removed after the run.
+
+Every child receives an environment with provider, signing, registry, and CI
+credentials removed. The default command never installs or registers an input
+method, mutates TIS, opens TextEdit, requests TCC, uses a microphone, or calls a
+live provider. Child logs go to stderr; stdout contains fixed stage/result
+NDJSON.
+
+On a machine that satisfies the release requirements below, append the formal
+per-user Gate 0 to the same serial flow:
+
+```sh
+npm run native-input:test:full -- \
+  --release-app "/Applications/Qwen Audio Agent.app"
+```
+
+All automatic stages must pass before Gate 0 starts. This option preserves Gate
+0's single explicit `RUN` confirmation and any macOS-owned first-setup dialog;
+there is no unattended approval flag or authorization bypass. It still does not
+run the physical-microphone or live-provider matrix.
 
 ## Blocking per-user release Gate 0
 

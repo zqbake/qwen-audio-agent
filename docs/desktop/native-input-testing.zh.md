@@ -18,7 +18,8 @@ macOS 输入源状态；未经机器所有者明确授权，不得执行人工�
 - 跨应用 InputMethodKit 真实交互：已用 fake transcript 验证 TextEdit 与
   Safari textarea/contenteditable/password；Terminal 和更广应用矩阵仍未完成。
 - 物理麦克风与 TCC 授权链路：未运行。
-- 基于 Accessibility 的可选 Voice Send：未实现、未授权。
+- 基于 Accessibility 的可选 Voice Send 与最近一次自有文本修正：已通过显式、
+  默认关闭的设置实现并纳入自动化；真实 TCC 授权与真机验证尚未执行。
 - Developer ID 签名、公证与 Release Gatekeeper：未运行。
 
 当前下一阻断项是下文可重复的 per-user Release Gate 0。正式签名路径未由一手
@@ -82,6 +83,34 @@ codesign --verify --deep --strict \
 
 两个原生产物都必须同时包含 `arm64` 与 `x86_64`。本地构建使用 ad-hoc
 签名，只能证明构建和完整性，不能代替正式签名、公证与 Gatekeeper 验收。
+
+## 自动化全流程开发门禁
+
+用一个命令执行完整、但不安装输入法的开发流程：
+
+```sh
+npm run native-input:test:full
+```
+
+该命令严格串行执行原生测试、仓库全量测试、lint、Web 构建、universal 原生
+Release 构建、架构与精确 identifier 签名校验、在本轮自有临时目录中的 ad-hoc
+Desktop DMG 打包、打包后 App/Bridge/IME 的签名与架构校验、DMG 校验及 Desktop
+smoke；结束后删除本轮临时打包目录。
+
+每个子进程都会移除 provider、签名、registry 与 CI 凭据。默认命令不会安装或注册
+输入法，不修改 TIS，不打开 TextEdit，不申请 TCC，不使用麦克风，也不调用真实
+provider。子进程日志写入 stderr，stdout 只输出固定 stage/result NDJSON。
+
+在满足下文正式发行条件的机器上，可把 per-user Gate 0 追加到同一串行流程末尾：
+
+```sh
+npm run native-input:test:full -- \
+  --release-app "/Applications/Qwen Audio Agent.app"
+```
+
+只有全部自动阶段通过后才会进入 Gate 0。该选项保留 Gate 0 唯一的显式 `RUN`
+确认及 macOS 自有首次 setup 弹窗，不提供无人值守批准参数，也不绕过系统授权；
+它仍不执行物理麦克风或真实 provider 矩阵。
 
 ## 阻断性的 per-user Release Gate 0
 
