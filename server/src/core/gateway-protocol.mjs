@@ -10,13 +10,27 @@
 // Every capability listed here is locked by a test (see docs/contract.md);
 // anything not listed is internal and may change in any release.
 //
+// 5.0.0 removes the backend-controlled Task presentation envelope. Backend
+// outcomes now expose factual `content` plus optional typed `artifacts`; the
+// frontend Chatbot owns spoken expression and each Conversation Client owns
+// rendering. It also publishes the existing Realtime event model as the
+// replaceable Conversation Client boundary.
+// 4.0.0 replaces the dual workId/jobId Task identity with one short `id`
+// (`task_id` in model tool results) and adds task.updated snapshots for
+// normalized backend messages and artifacts.
+// 3.1.0 adds bounded citations to final assistant transcript events.
+// 3.0.0 gives public Tasks A2A-aligned work states and first-class artifact
+// and authorization values. This replaces the 2.x `active`
+// state and opaque result metadata, so event consumers must branch on the
+// capability below before reading the new fields.
+// 2.1.0 adds an opt-in AG-UI projection while preserving the native stream.
 // 2.0.0 succeeds the 1.x line of the feat/embedded-gateway-host-contract
 // fork (last 1.7.0). The major bump is semantic, not cosmetic: capabilities
 // that line advertised (gateway.embedded-lifecycle, gateway.self-terminate,
 // desktop.settings-window, …) are not part of this contract, and a removed
 // capability is a breaking change. Hosts migrating from the fork must branch
 // on the capability list below, never on the version number.
-export const GATEWAY_PROTOCOL_VERSION = '2.1.0'
+export const GATEWAY_PROTOCOL_VERSION = '5.0.0'
 
 export const GATEWAY_CAPABILITIES = Object.freeze([
   // The Gateway statically hosts web/dist at its own origin, so a client may
@@ -55,6 +69,23 @@ export const GATEWAY_CAPABILITIES = Object.freeze([
   'input.suspend-ttl',
   // Clients confirm a suspension with input.suspend.ack.
   'input.suspend-ack',
+  // GET /api/tasks/:id/events?format=ag-ui projects the existing public Task
+  // stream into AG-UI ACTIVITY_SNAPSHOT events. The default stream is
+  // unchanged.
+  'tasks.ag-ui-event-stream',
+  // Native Task events expose A2A-aligned submitted/working/auth_required
+  // states plus factual results, typed artifacts and authorization values.
+  'tasks.structured-results-authorization',
+  // Every public Task has one short `id`; task.updated carries incremental
+  // backend messages and artifacts without exposing adapter protocol objects.
+  'tasks.unified-id-updates',
+  // Final assistant transcript events may carry bounded, normalized citations
+  // collected from frontend retrieval tools during the same user turn.
+  'messages.citations',
+  // WS /api/realtime plus the published event constants and schemas form the
+  // replaceable Conversation Client boundary for audio, text, multimodal
+  // input, transcripts, playback receipts, voice state and Task projections.
+  'realtime.conversation-client-v1',
   // The orb shell contract ships: qwen-audio-agent/orb/preload plus
   // orb/main's bindOrbShell, so a host may run the floating orb form.
   'desktop.orb-shell',

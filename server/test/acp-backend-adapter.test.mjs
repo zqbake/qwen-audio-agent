@@ -9,23 +9,11 @@ import {
 } from '../src/agent/acp-backend-adapter.mjs'
 
 function completed(speech = '完成') {
-  return JSON.stringify({
-    job_id: 'work-one',
-    state: 'completed',
-    mode: 'respond',
-    presentation: { speech, inline: null },
-  })
+  return speech
 }
 
-function delegated(result) {
-  return JSON.stringify({
-    job_id: 'work-one',
-    state: 'delegated',
-    mode: 'delegate',
-    delegation_id: result.delegation_id,
-    target_session_id: result.session_id,
-    presentation: { speech: '已经交给独立项目处理。', inline: null },
-  })
+function delegated() {
+  return '已经交给独立项目处理。'
 }
 
 function fakeToolServer() {
@@ -35,9 +23,11 @@ function fakeToolServer() {
     updateCalls: 0,
     releaseCalls: 0,
     registrations: [],
-    async register(context) {
+    registerOptions: [],
+    async register(context, options = {}) {
       this.context = context
       this.registerCalls += 1
+      this.registerOptions.push(options)
       const registration = {
         context,
         released: false,
@@ -141,7 +131,7 @@ function fakeAcpClient({
       return values.filter(session => session.cwd === cwd)
     },
     async prompt(sessionId, prompt, options = {}) {
-      calls.push(['prompt', sessionId, prompt])
+      calls.push(['prompt', sessionId, prompt, options])
       if (sessionId !== 'coordinator-session') {
         if (options.signal?.aborted) throw options.signal.reason
         for (const update of targetUpdates) options.onUpdate?.(update)
@@ -186,23 +176,25 @@ function fakeAcpClient({
           response: { stopReason: 'end_turn' },
         }
       }
-      if (prompt.includes('qwen_audio_agent_delegation_result')) {
+      if (prompt.includes('刚才交给独立任务处理的工作已经完成')) {
         return {
           content: completed('第三层结果已整理'),
           response: { stopReason: 'end_turn' },
         }
       }
-      const result = action === 'send'
-        ? await toolServer.context.sendSession({
-            session_id: 'previous-session',
-            prompt: 'continue previous work',
-          })
-        : await toolServer.context.startSession({
-            prompt: 'build project',
-            title: 'Project',
-          })
+      if (action === 'send') {
+        await toolServer.context.sendSession({
+          session_id: 'previous-session',
+          prompt: 'continue previous work',
+        })
+      } else {
+        await toolServer.context.startSession({
+          prompt: 'build project',
+          title: 'Project',
+        })
+      }
       return {
-        content: delegated(result),
+        content: delegated(),
         response: { stopReason: 'end_turn' },
       }
     },
@@ -383,7 +375,7 @@ test('retries an empty ACP coordinator response in a fresh Session', async () =>
 
   assert.deepEqual(prompts, ['coordinator-1', 'coordinator-2'])
   assert.equal(
-    JSON.parse(result.content).presentation.speech,
+    result.content,
     '新 Session 已恢复',
   )
   await adapter.close()
@@ -431,7 +423,7 @@ test('retries an OpenClaw reply initialization conflict in the same Session', as
   assert.deepEqual(prompts, ['coordinator-1', 'coordinator-1'])
   assert.equal(nextSession, 1)
   assert.equal(
-    JSON.parse(result.content).presentation.speech,
+    result.content,
     '同一 Session 重试成功',
   )
   await adapter.close()
@@ -537,7 +529,7 @@ test('continues a remembered project Session using only its Session ID', async (
     coordinationRunId: 'work-one',
   })
   assert.equal(
-    JSON.parse(result.content).presentation.speech,
+    result.content,
     '第三层结果已整理',
   )
   assert.ok(client.calls.some(call => (
@@ -669,6 +661,7 @@ test('uses one ACP profile family while preserving backend differences', () => {
     externalMcp: true,
     nativeDelegation: false,
     sessionMcp: true,
+    coordinatorMcpInstructions: true,
   })
   const openClaw = acpBackendProfile({
     protocol: 'openclaw',
@@ -1064,11 +1057,51 @@ test('keeps a cached coordinator MCP connection valid across turns', async () =>
   assert.equal(tools.updateCalls, 1)
   assert.equal(tools.releaseCalls, 0)
   assert.equal(resumedDescriptors[0].url, cachedDescriptor.url)
-  assert.equal(second.run.delegation.workId, 'work-two')
+  assert.equal(second.run.delegation.taskId, 'work-two')
   assert.equal(second.run.delegation.ownerId, 'owner-one')
   await second.run.delegation.promise
   await adapter.close()
   assert.equal(tools.releaseCalls, 1)
+})
+
+test('moves stable coordinator rules into MCP instructions for verified backends', async () => {
+  const tools = fakeToolServer()
+  const prompts = []
+  const client = {
+    async newSession(options) {
+      return {
+        sessionId: 'coordinator-session',
+        cwd: options.cwd,
+        response: {},
+      }
+    },
+    async prompt(_sessionId, prompt) {
+      prompts.push(prompt)
+      return {
+        content: completed('done'),
+        response: { stopReason: 'end_turn' },
+      }
+    },
+    async close() {},
+  }
+  const adapter = new AcpBackendAdapter({
+    protocol: 'qwen',
+    directory: '/coordinator',
+    client,
+    sessionToolServer: tools,
+  })
+  await adapter.runCoordinator('dynamic task instruction', {
+    ownerId: 'owner-one',
+    coordinationRunId: 'work-one',
+  })
+
+  assert.equal(adapter.coordinatorUsesMcpInstructions(), true)
+  assert.match(tools.registerOptions[0].instructions, /Session routing:/)
+  assert.match(tools.registerOptions[0].instructions, /qwen-audio-agent's backend/)
+  assert.doesNotMatch(prompts[0], /Session routing:/)
+  assert.doesNotMatch(prompts[0], /qwen-audio-agent's backend/)
+  assert.match(prompts[0], /dynamic/)
+  await adapter.close()
 })
 
 test('replaces a persisted coordinator without the current coordinator contract', async () => {
@@ -1124,7 +1157,7 @@ test('replaces a persisted coordinator without the current coordinator contract'
   assert.equal(creates, 1)
   assert.equal(deleted.length, 1)
   assert.equal(saved[0][1].sessionId, 'fresh-coordinator')
-  assert.equal(saved[0][1].contractVersion, 2)
+  assert.equal(saved[0][1].contractVersion, 6)
   await adapter.close()
 })
 
@@ -1217,9 +1250,10 @@ for (const action of ['start', 'send']) {
     const result = await adapter.runCoordinator('delegate', {
       ownerId: 'owner-one',
       coordinationRunId: 'work-one',
+      workObjective: '开发一个独立网页游戏',
       onEvent: event => events.push(event),
     })
-    assert.equal(JSON.parse(result.content).presentation.speech, '第三层结果已整理')
+    assert.equal(result.content, '第三层结果已整理')
     assert.ok(events.some(event => event.type === 'backend.delegated'))
     assert.ok(events.some(
       event => event.type === 'backend.delegation.completed',
@@ -1240,6 +1274,17 @@ for (const action of ['start', 'send']) {
     ))
     assert.equal(coordinatorPrompts.length, 2)
     assert.equal(
+      client.calls
+        .filter(call => call[0] === 'prompt')
+        .every(call => call[3].timeoutMs === 0),
+      true,
+    )
+    assert.match(
+      JSON.stringify(coordinatorPrompts[1][2]),
+      /原任务：开发一个独立网页游戏/u,
+    )
+    assert.doesNotMatch(JSON.stringify(coordinatorPrompts[1][2]), /work-one/u)
+    assert.equal(
       client.calls.some(call => call[0] === 'config'),
       false,
     )
@@ -1247,7 +1292,7 @@ for (const action of ['start', 'send']) {
   })
 }
 
-test('ACP permissions expose permanent allow and reject semantics', async () => {
+test('ACP permissions expose detailed session-scoped allow and reject semantics', async () => {
   const client = fakeAcpClient()
   const adapter = new AcpBackendAdapter({
     protocol: 'opencode',
@@ -1271,7 +1316,13 @@ test('ACP permissions expose permanent allow and reject semantics', async () => 
     toolCall: {
       toolCallId: 'tool-one',
       name: 'write',
-      rawInput: { path: '/tmp/file' },
+      title: 'Write project file',
+      kind: 'edit',
+      locations: [{ path: '/tmp/file', line: 12 }],
+      rawInput: {
+        path: '/tmp/file',
+        description: 'Update the generated project',
+      },
     },
     options,
   }, {
@@ -1280,17 +1331,31 @@ test('ACP permissions expose permanent allow and reject semantics', async () => 
   const requested = events.find(event => (
     event.type === 'backend.permission.requested'
   ))
-  await adapter.respondPermission(requested.permission.id, 'always', {
+  assert.equal(requested.permission.approvalScope, 'session')
+  assert.equal(
+    requested.permission.summary,
+    'Write project file：Update the generated project',
+  )
+  assert.deepEqual(requested.permission.operation, {
+    title: 'Write project file',
+    kind: 'edit',
+    description: 'Update the generated project',
+    path: '/tmp/file',
+    locations: [{ path: '/tmp/file', line: 12 }],
+  })
+  await adapter.resolveAuthorization(requested.permission.id, 'always', {
     ownerId: 'owner-one',
   })
   assert.deepEqual(await pending, {
+    // Gateway owns the session-wide policy, so the backend receives the
+    // narrowest option for each individual request.
     outcome: { outcome: 'selected', optionId: 'once' },
   })
   assert.ok(events.some(event => (
     event.type === 'backend.permission.resolved'
   )))
   assert.deepEqual(
-    await adapter.respondPermission(requested.permission.id, 'always', {
+    await adapter.resolveAuthorization(requested.permission.id, 'always', {
       ownerId: 'owner-one',
     }),
     events.find(event => event.type === 'backend.permission.resolved').permission,
@@ -1310,7 +1375,7 @@ test('ACP permissions expose permanent allow and reject semantics', async () => 
     event.type === 'backend.permission.requested'
   )).at(-1)
   assert.notEqual(repeatedRequest.permission.id, requested.permission.id)
-  await adapter.respondPermission(repeatedRequest.permission.id, 'reject', {
+  await adapter.resolveAuthorization(repeatedRequest.permission.id, 'reject', {
     ownerId: 'owner-one',
   })
   assert.deepEqual(await repeated, {
@@ -1366,7 +1431,7 @@ test('permission cleanup is isolated to the ACP prompt that requested it', async
   )
   assert.equal(coordinatorEvents.at(-1).permission.status, 'cancelled')
   assert.equal(adapter.pendingPermissions.has(projectPermission.id), true)
-  await adapter.respondPermission(projectPermission.id, 'always', {
+  await adapter.resolveAuthorization(projectPermission.id, 'always', {
     ownerId: 'owner-one',
   })
   assert.deepEqual(await project, {
@@ -1420,7 +1485,7 @@ test('delegated status and cancellation bypass the coordinator', async () => {
     '做到哪了',
     { ownerId: 'owner-one' },
   )
-  assert.equal(JSON.parse(status.content).presentation.speech,
+  assert.equal(JSON.parse(status.content).result,
     '这项工作仍在执行中，当前没有新的详细进展。')
   assert.equal(status.metadata.statusSource, 'gateway')
   const cancelled = await adapter.cancelWork('work-one', {
@@ -1466,8 +1531,11 @@ test('busy-coordinator cancellation uses ACP directly and reconciles on the next
   const followUp = client.calls.findLast(call => (
     call[0] === 'prompt' && call[2].includes('plain follow-up')
   ))
-  assert.match(followUp[2], /qwen_audio_agent_reconciliation/)
-  assert.match(followUp[2], /coordination_request_terminated/)
+  assert.match(
+    followUp[2],
+    /上一请求已取消，不要续接其未完成内容/,
+  )
+  assert.doesNotMatch(followUp[2], /work-one|request_id|delegation_id/)
   assert.equal(
     adapter.registry.reconciliationsFor('opencode:owner-one:backend').length,
     0,
@@ -1531,11 +1599,10 @@ test('ordinary coordinator cancellation terminates the old request before the ne
     coordinationRunId: 'work-two',
     coordinationRequestId: 'job_2',
   })
-  assert.equal(JSON.parse(second.content).presentation.speech, '第二个请求已完成')
-  assert.match(prompts[1], /coordination_request_terminated/)
-  assert.match(prompts[1], /"request_id":"job_1"/)
-  assert.doesNotMatch(prompts[1], /"request_id":"work-one"/)
-  assert.match(prompts[1], /current request 是本轮唯一需要处理的请求/)
+  assert.equal(second.content, '第二个请求已完成')
+  assert.match(prompts[1], /上一请求已取消，不要续接其未完成内容/)
+  assert.doesNotMatch(prompts[1], /job_1|work-one|request_id/)
+  assert.match(prompts[1], /仅处理以下新请求/)
   assert.deepEqual(
     adapter.registry.reconciliationsFor('qoder:owner-one:backend'),
     [],
@@ -1631,9 +1698,11 @@ test('delivers persisted cancellation reconciliation after a Gateway restart', a
     // Once to restore the persisted Session and once to re-supply its MCP
     // definitions before the first prompt after restart.
     assert.equal(resumes, 2)
-    assert.match(prompts[0], /coordination_request_terminated/)
-    assert.match(prompts[0], /"request_id":"job_21"/)
-    assert.doesNotMatch(prompts[0], /"request_id":"work-before-restart"/)
+    assert.match(prompts[0], /上一请求已取消，不要续接其未完成内容/)
+    assert.doesNotMatch(
+      prompts[0],
+      /job_21|work-before-restart|request_id/,
+    )
     assert.deepEqual(
       secondAdapter.registry.reconciliationsFor('qoder:owner-one:backend'),
       [],
@@ -1671,7 +1740,7 @@ test('busy-coordinator status query returns Gateway-known state immediately', as
   )
   adapter.activeCoordinatorTurns.delete('coordinator-session')
   assert.equal(client.calls.length, before)
-  assert.equal(JSON.parse(status.content).presentation.speech,
+  assert.equal(JSON.parse(status.content).result,
     '这项工作仍在执行中，当前没有新的详细进展。')
   assert.equal(status.metadata.statusSource, 'gateway')
   await adapter.cancelWork('work-one', { ownerId: 'owner-one' })
@@ -2126,14 +2195,7 @@ test('OpenClaw maps native Session tool updates into the shared delegation lifec
           },
         })
         return {
-          content: JSON.stringify({
-            job_id: 'work-one',
-            state: 'delegated',
-            mode: 'delegate',
-            delegation_id: 'run-one',
-            target_session_id: 'agent:child:one',
-            presentation: { speech: 'OpenClaw 已开始执行。', inline: null },
-          }),
+          content: 'OpenClaw 已开始执行。',
           response: { stopReason: 'end_turn' },
         }
       }
@@ -2169,7 +2231,7 @@ test('OpenClaw maps native Session tool updates into the shared delegation lifec
   })
   const result = await running
   assert.equal(
-    JSON.parse(result.content).presentation.speech,
+    result.content,
     'OpenClaw 第三层结果已整理',
   )
   assert.deepEqual(nativeCalls, [[
@@ -2239,7 +2301,7 @@ test('OpenClaw reattaches a persisted native delegation after Gateway restart', 
   })
 
   assert.equal(
-    JSON.parse(result.content).presentation.speech,
+    result.content,
     '恢复结果已整理',
   )
   assert.ok(events.some(event => event.type === 'backend.delegated'))
@@ -2277,6 +2339,56 @@ test('releases completed ACP tool-call state instead of retaining it globally', 
   })
   assert.equal(run.toolCalls.size, 0)
   assert.equal(Object.hasOwn(adapter, 'toolCalls'), false)
+})
+
+test('streams only ACP Agent messages as backend progress text', () => {
+  const adapter = new AcpBackendAdapter({
+    protocol: 'qoder',
+    client: fakeAcpClient(),
+    sessionToolServer: fakeToolServer(),
+  })
+  const events = []
+  const run = {
+    toolCalls: new Map(),
+    nativeToolCalls: new Map(),
+    onEvent: event => events.push(event),
+  }
+
+  adapter.onSessionUpdate(run, {
+    sessionUpdate: 'agent_thought_chunk',
+    content: { type: 'text', text: '不应播报的内部推理' },
+  })
+  adapter.onSessionUpdate(run, {
+    sessionUpdate: 'tool_call',
+    toolCallId: 'tool-one',
+    name: 'Read',
+    status: 'in_progress',
+  })
+  adapter.onSessionUpdate(run, {
+    sessionUpdate: 'agent_message_chunk',
+    messageId: 'message-one',
+    content: { type: 'text', text: '已经完成资料读取，' },
+  })
+  adapter.onSessionUpdate(run, {
+    sessionUpdate: 'agent_message_chunk',
+    messageId: 'message-one',
+    content: { type: 'text', text: '正在整理结论。' },
+  })
+
+  const messages = events.filter(event => event.type === 'backend.message')
+  assert.deepEqual(messages.map(event => event.message), [
+    '已经完成资料读取，',
+    '已经完成资料读取，正在整理结论。',
+  ])
+  assert.ok(events.some(event => (
+    event.type === 'backend.activity'
+    && event.activity.kind === 'thinking'
+  )))
+  assert.ok(events.some(event => (
+    event.type === 'backend.activity'
+    && event.activity.kind === 'tool'
+  )))
+  assert.equal(messages.some(event => /内部推理|Read/.test(event.message)), false)
 })
 
 test('reports recent project Session updates with Gateway delegation status', async () => {

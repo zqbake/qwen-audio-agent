@@ -40,8 +40,7 @@ test('arbitrates visual states by layered priority', () => {
     connecting: true,
     ownershipBusy: true,
     voiceState: 'listening',
-    tasksActive: true,
-    attentionPending: true,
+    tasksWorking: true,
   }
   assert.equal(resolveOrbVisualState(everything), 'hidden')
   assert.equal(
@@ -70,7 +69,7 @@ test('arbitrates visual states by layered priority', () => {
       voiceState,
     }), voiceState)
   }
-  // 后台态优先级：attention > working > occupied > connecting > idle。
+  // 后台态优先级：working > occupied > connecting > idle。
   const background = {
     lifecycle: 'active',
     runtimeState: 'ready',
@@ -78,33 +77,21 @@ test('arbitrates visual states by layered priority', () => {
     connecting: true,
     ownershipBusy: true,
     voiceState: 'idle',
-    tasksActive: true,
-    attentionPending: true,
+    tasksWorking: true,
   }
-  assert.equal(resolveOrbVisualState(background), 'attention')
+  assert.equal(resolveOrbVisualState(background), 'working')
   assert.equal(resolveOrbVisualState({
     ...background,
-    tasksActive: false,
-  }), 'attention')
-  assert.equal(
-    resolveOrbVisualState({ ...background, attentionPending: false }),
-    'working',
-  )
-  assert.equal(resolveOrbVisualState({
-    ...background,
-    attentionPending: false,
-    tasksActive: false,
+    tasksWorking: false,
   }), 'occupied')
   assert.equal(resolveOrbVisualState({
     ...background,
-    attentionPending: false,
-    tasksActive: false,
+    tasksWorking: false,
     ownershipBusy: false,
   }), 'connecting')
   assert.equal(resolveOrbVisualState({
     ...background,
-    attentionPending: false,
-    tasksActive: false,
+    tasksWorking: false,
     ownershipBusy: false,
     connecting: false,
   }), 'idle')

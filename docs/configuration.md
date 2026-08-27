@@ -185,12 +185,7 @@ restarts the backend process and always resolves it.
 All backends now share one default working directory,
 `<config-dir>/workspace`, so switching backends continues the same files
 seamlessly. Per-backend overrides (for example `OPENCODE_WORKSPACE`)
-still isolate a specific backend when set explicitly. Older versions used
-per-backend directories under `<config-dir>/workspaces/<backend>/`; if such a
-directory still contains files, the gateway logs a
-`workspace.legacy_directory` notice on startup. Files are never migrated or
-deleted automatically — move anything you still need into the shared
-workspace manually.
+still isolate a specific backend when set explicitly.
 
 ## Minimal Configuration
 
@@ -199,6 +194,47 @@ The minimal configuration only requires real-time voice credentials:
 ```dotenv
 DASHSCOPE_API_KEY=your-key
 ```
+
+The frontend `web_search` tool returns verifiable source links, does not create
+backend Agent work, and does not invoke another text model. Without explicit
+configuration it uses a small, key-free 360 search adapter that parses one
+public search results page and is reachable in mainland China. This basic
+fallback is experimental: it may be blocked, return weak results, or break
+with upstream changes. Configure your own provider for reliable search.
+
+After enabling Model Studio's Web Search MCP service, select its built-in preset
+explicitly; it then reuses `DASHSCOPE_API_KEY`:
+
+```dotenv
+QWEN_AUDIO_WEB_SEARCH_PROVIDER=bailian
+```
+
+The same provider-neutral adapter can connect to another compatible MCP search
+service. Custom endpoints must provide their own credentials explicitly:
+
+```dotenv
+QWEN_AUDIO_WEB_SEARCH_PROVIDER=mcp
+QWEN_AUDIO_WEB_SEARCH_MCP_URL=https://example.com/mcp
+QWEN_AUDIO_WEB_SEARCH_MCP_TOKEN=your-token
+QWEN_AUDIO_WEB_SEARCH_MCP_TOOL=web_search
+```
+
+Set `QWEN_AUDIO_WEB_SEARCH_PROVIDER=none` to disable frontend web search.
+
+General chatbot tools can be connected through the frontend MCP client. Set
+`QWEN_AUDIO_FRONTEND_MCP_CONFIG` to its versioned JSON file; tools must be
+enabled individually and writable operations require confirmation. See
+[Frontend MCP client](reference/frontend-mcp.md).
+
+REST services with an OpenAPI 3.x document use the same tool and approval
+boundary through `QWEN_AUDIO_FRONTEND_OPENAPI_CONFIG`. See
+[Frontend OpenAPI tool adapter](reference/frontend-openapi.md).
+To keep the assistant persona, MCP configuration, and OpenAPI configuration as
+one local frontend bundle, set only `QWEN_AUDIO_FRONTEND_PROFILE`. See
+[Lightweight Frontend Profiles](reference/frontend-profile.md).
+WebUI and terminal clients show the normalized source links below the final
+assistant answer; other clients can consume the same `messages.citations`
+Gateway capability.
 
 When you need to execute backend tasks, select a backend Agent (using OpenClaw as an example):
 
@@ -467,6 +503,11 @@ The generic entry point has the Gateway directly manage the ACP subprocess. `ACP
 recommended to be written as a JSON string array so that arguments containing spaces can still
 be parsed accurately. It uses standard ACP Sessions and Gateway-provided Session MCP tools, and
 does not assume any Agent's private startup, permission, or UI capabilities.
+
+Action systems without ACP can implement `BackendPort` in a custom Node
+launcher; see the [Backend Adapter SDK](reference/backend-adapter-sdk.md). SDK
+composition does not add an `AGENT_PROTOCOL` name or let configuration files
+dynamically load arbitrary code.
 
 ### Hermes
 
@@ -877,13 +918,20 @@ them to the configuration file:
 | `QWEN_AUDIO_AGENT_ACP_FORWARD_ENV` | Empty; comma-separated opt-in environment names for generic ACP only |
 | `QWEN_AUDIO_REALTIME_MODEL` | `qwen-audio-3.0-realtime-plus` |
 | `QWEN_AUDIO_REALTIME_PROVIDER` | `dashscope` |
+| `QWEN_AUDIO_WEB_SEARCH_PROVIDER` | `so360`; optional `bailian`, `bing`, `mcp`, or `none` |
+| `QWEN_AUDIO_WEB_SEARCH_MCP_URL` | Empty; custom Streamable HTTP endpoint used by the `mcp` provider |
+| `QWEN_AUDIO_WEB_SEARCH_MCP_TOKEN` | `DASHSCOPE_API_KEY` for explicit `bailian`; empty for custom endpoints unless set |
+| `QWEN_AUDIO_WEB_SEARCH_MCP_TOOL` | `bailian_web_search` for `bailian`; otherwise `web_search` |
+| `QWEN_AUDIO_FRONTEND_PROFILE` | Empty; path to a lightweight Frontend Profile JSON file |
+| `QWEN_AUDIO_FRONTEND_MCP_CONFIG` | Empty; absolute path to the versioned frontend MCP JSON file |
+| `QWEN_AUDIO_FRONTEND_OPENAPI_CONFIG` | Empty; absolute path to the versioned frontend OpenAPI JSON config file |
 | `QWEN_AUDIO_REALTIME_VOICE` | Empty; optional Audio-family override, otherwise runtime uses `longanqian` |
 | `QWEN_OMNI_REALTIME_VOICE` | Empty; optional Omni-family override, otherwise runtime uses `Ethan` |
 | `SPEECH_TO_SPEECH_REALTIME_URL` | `ws://127.0.0.1:8765/v1/realtime` |
 | `SPEECH_TO_SPEECH_AUTH_TOKEN` | Empty; only for proxies with Bearer authentication |
 | `QWEN_AUDIO_AGENT_IDENTITY_MODE` | `personal` |
 | `QWEN_AUDIO_AGENT_TUI_AUDIO_MODE` | `half` |
-| `AGENT_TIMEOUT_MS` | `300000` |
+| `AGENT_TIMEOUT_MS` | `300000`; timeout for ACP connection initialization and bounded control requests, not active Agent turns |
 
 The macOS TUI CoreAudio helper is compiled by default to
 `~/Library/Caches/qwaudio/tui/macos-voice-io`, requiring no additional configuration. It

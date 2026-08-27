@@ -2,17 +2,23 @@
 
 本文档定义产品边界。违反这些不变性的变更属于架构变更，而非局部功能开发。
 
+前台 Realtime Voice Chatbot、异步 Task Bridge 与单一用户后台 Agent 的目标边界及
+分阶段重构计划见
+[Realtime Voice Chatbot Runtime Roadmap](https://github.com/QwenAudio/qwen-audio-agent/blob/main/docs/roadmap/frontend-chatbot-runtime.zh.md)。
+在 Roadmap 分阶段落地期间，本文继续描述当前已实现并受测试保护的运行时行为。
+
 ## 1. 用户可见模型
 
 用户与一个 qwen-audio 助手对话。内部存在两个 qwen-audio-agent 层：
 
 1. **实时前端** — 全双工语音、简单直接回答，以及基本的本地时间/记忆工具。
-2. **后端 Agent** — 一个持久 Agent Session，负责处理所有需要工具、当前信息、文件、应用程序、代码或多步工作的请求。
+2. **后端 Agent** — 一个用户配置的办事 Agent，负责处理需要工具、文件、应用程序、代码、设备控制或多步执行的请求。
 
-后端可以是 OpenCode、OpenClaw、Qoder、Qwen Code、Kimi Code、Pi 或其他 ACP 兼容 Agent。
+后端可以是 OpenCode、OpenClaw、Qoder、Qwen Code、Kimi Code、Pi 等 ACP Agent，
+也可以是远程 A2A Agent 或自定义 BackendPort Adapter。
 它内部可以使用工具、技能、Agent 或其他 Session。这些都是后端私有实现细节，
-不会创建额外的 qwen-audio-agent 层。所有后端通过一个 ACP 客户端和一个
-共享协调适配器连接；后端特定的启动和能力行为位于已注册的驱动程序中。
+不会创建额外的 qwen-audio-agent 层。ACP、A2A 或自定义协议细节只存在于各自
+BackendPort Adapter 内；后端特定的启动和能力行为位于已注册的驱动程序中。
 
 ## 2. 非阻塞请求流
 
@@ -24,13 +30,13 @@ final ASR
    └─ requires work
           │ spawn_thinking(objective)
           ▼
-      Work accepted
+      Task accepted
           │ response returns to Realtime immediately
           ▼
       owner FIFO queue
           │
           ▼
-      fixed Backend Agent Session
+      configured BackendPort
           │ the backend decides how to work
           ▼
       final presentation
@@ -39,8 +45,8 @@ final ASR
       Realtime naturally speaks the result
 ```
 
-`spawn_thinking` 永不等待所请求的工作完成。用户可以在多个 Work 项排队期间继续
-说话。对于每个 owner，一次只有一个 Work 项被发送到后端 Agent Session。
+`spawn_thinking` 永不等待所请求的工作完成。用户可以在多个 Task 项排队期间继续
+说话。对于每个 owner，一次只有一个 Task 项被发送到配置的 BackendPort。
 
 ## 3. 实时边界
 
@@ -86,10 +92,8 @@ respond_agent_permission
 用户明确表达破坏性意图。
 
 `get_agent_task_status` 是生命周期、进度和中间结果问题的唯一实时入口。
-Gateway 直接回答非委派 Work。对于 `delegated` Work，它创建一个隐藏的、
-高优先级的控制查询，使用协调器调用 `session_status`。该查询排在已运行的
-协调器轮次之后、普通排队 Work 之前，其结果通过正常的异步通告路径传递。
-它不作为用户 Work 项暴露，也不能成为后续状态或取消请求的隐式目标。
+Gateway 直接读取自身持有的 Task 记录，包括 Adapter 归一化后的最新消息、活动和
+产物摘要。状态查询不会创建另一个 Task，不调用协调 Agent，也不进入异步播报队列。
 
 实时前端没有以下工具：
 
@@ -102,14 +106,21 @@ Gateway 直接回答非委派 Work。对于 `delegated` Work，它创建一个�
 它只能转发由 Gateway 提供的、针对待处理的、owner 作用域权限请求的明确当前轮次
 用户决策。它可以理解自然的肯定或否定措辞，如"可以"或"不允许"，但不能在没有
 当前轮次用户话语的情况下虚构同意、创建请求、选择工具或修改后端权限策略。
-回复仅限于 `always` 和 `reject`；`always` 在可用时使用后端的 Session 作用域
-权限选项。
+回复仅限于 `always` 和 `reject`；`always` 使用 Gateway 当前前端会话的策略。
+Adapter 仍选择最窄的单次后端权限选项，
+后续请求由 Gateway 在同一前端会话内自动允许，不会创建持久的后端授权规则。
 
 传递给 `spawn_thinking` 的 `objective` 是对用户请求的保守解释，而非执行计划。
-最近的语音上下文会单独包含在后端 Agent 信封中，因此诸如"继续那个页面"之类的
-引用仍然可以理解。final ASR 仍然是事实来源。当前轮附件由 Gateway 自动随任务
-传递；只有任务明确依赖此前轮次的图片或文件时，前台才通过可选的 `input_refs`
-引用 Gateway 分配的会话内输入 ID。没有多模态输入的调用保持原协议不变。
+提交前必须结合当前对话把"继续那个页面"之类的指代解析成一条自包含指令。该指令就是
+后台 Agent 唯一收到的模型可见文本；ASR 原文不再作为第二份任务描述附加。后台 Agent
+不接收前台人格、长期记忆或最近聊天历史；与执行有关的事实必须先解析进指令，而不是
+转发这些文档。
+
+当前轮附件由 Gateway 自动作为协议原生 Part 随任务传递，而不是放入模型可见的 JSON
+清单。只有任务明确依赖此前轮次的图片或文件时，前台才通过可选的 `input_refs` 引用
+Gateway 分配的会话内输入 ID。Task ID、owner、生命周期、时间戳和路由继续作为
+Gateway/BackendPort 的结构化数据，不进入后台 Agent 的任务指令。工作目录和用户
+时区也不重复拼入每轮文本；协议或后台自身的运行上下文负责这些信息。
 
 ## 4. 固定后端 Agent Session
 
@@ -123,18 +134,19 @@ Gateway 在该稳定键之后存储原生 ACP Session ID，并在后续轮次调
 `session/resume`。项目委派同样在其记录的工作目录中恢复选定的原生 Session，
 因此语音发起的工作保留在后端自己的 Session 历史中，而非 Gateway 副本中。
 
-语音浏览器会话 ID 和 Work ID 不会更改该身份。因此，新的语音对话会继续使用
+语音浏览器会话 ID 和 Task ID 不会更改该身份。因此，新的语音对话会继续使用
 相同的后端 Agent 上下文。
 
 Gateway 队列和 ACP 适配器都对写入进行串行化。这种双重保护防止并发消息在一个
 后端 Session 内部发生竞争。
 
-后端 Agent 拥有自己的执行策略。qwen-audio-agent 提供用户请求、最近的语音上下文、
-本地偏好和最终响应格式；它不指导后端 Agent 如何使用后端特定能力。
+后端 Agent 拥有自己的执行策略。qwen-audio-agent 只提供一条自包含自然任务指令和
+当前轮次的协议原生附件；它不转发前台历史或偏好，不规定状态 JSON，也不指导后端
+Agent 如何使用后端特定能力。
 
-## 5. Work 状态
+## 5. Task 状态
 
-qwen-audio-agent Work 记录是交付回执，而非后端内部任务图的镜像。
+qwen-audio-agent Task 记录是交付回执，而非后端内部任务图的镜像。
 
 ```text
 queued → running ─────────────────────────→ completed
@@ -143,14 +155,15 @@ queued → running ────────────────────�
                             ↘ failed
 ```
 
-公共字段仅限于用户请求、时间戳、最终结果/错误、通用工具活动、有界的待处理权限
-摘要和通知状态。不存在执行模式、交付模式、子 Agent 状态、后端权限标识符、
-后端拓扑或后端取消内部信息。
+公共字段仅限于用户请求、时间戳、最终结果/错误、通用活动、带可选安全操作详情的
+有界待处理权限摘要和通知状态。不存在执行模式、交付模式、子 Agent 状态、后端
+权限标识符、后端拓扑或后端取消内部信息。
 
 UI 将 `queued` 和 `running` 呈现为相同的"处理中"状态。队列位置是内部调度细节，
 不会改变用户的双工对话。
 
-活跃 Work 在 Gateway 重启后无法安全恢复，因此会变为 failed 并附带明确的重启原因。
+排队中和直接执行中的 Task 在 Gateway 重启后无法安全恢复，因此会变为 failed 并附带
+明确的重启原因。委派 Task 只有在 Adapter 能确认持久化原生 Session 时才会重新挂接。
 已完成的结果和通知交付状态会被持久化。
 
 ## 6. 进度动画
@@ -158,32 +171,28 @@ UI 将 `queued` 和 `running` 呈现为相同的"处理中"状态。队列位置
 进度是可观测性，而非控制。ACP 适配器将标准 `session/update` 通知投射为通用活动：
 
 - 工具名称、有界的用户安全详情和运行中/已完成状态；
-- 文本/推理活动仅表示为"整理结果"。
+- 计划进度；
+- 不含思考内容的通用思考信号；
+- 有界的 Session 标题和当前模式元数据。
 
-UI 将此映射为稳定的短语，如"搜索中"、"读取中"、"生成图像"或"整理结果"。
-Session ID、子 Agent ID、原始权限载荷和原始推理不显示。待处理权限可以在
-类密钥值被脱敏后，显示精确的有界操作或命令，以便知情同意。
+UI 将此映射为稳定的任务说明或短语，如"搜索中"、"读取中"、"生成图像"或当前模式；
+通用思考信号继续显示任务目标。包括 thinking 在内的所有活跃后台工作，在桌面宠物上
+统一呈现为 `working`；`processing` 只保留给前台 Realtime 轮次。Session ID、
+子 Agent ID、原始权限载荷和原始思考内容不显示。待处理权限可以在类密钥值被脱敏后，
+显示精确且有界的标题、说明、命令或路径，以便知情同意，但不会引入单独的 Agent
+动画状态。
 
 活动绝不会产生语音状态更新，也绝不影响队列。
 
 ## 7. 最终结果交付
 
-后端 Agent 返回一个最终呈现：
-
-```json
-{
-  "work_id": "work id",
-  "state": "completed",
-  "mode": "respond",
-  "presentation": {
-    "speech": "concise result material",
-    "inline": null
-  }
-}
-```
-
-`speech` 是语义材料，而非脚本。实时前端会将其适配到实时对话中。`inline` 携带
-Markdown、代码或链接，用于共享时间线。
+后端 Agent 通过标准 ACP 回合返回结果：正文来自 `agent_message_chunk`，图片、音频和
+资源保留为原生 `ContentBlock`，回合以 `session/prompt` 的 `PromptResponse` 结束。
+ACP Adapter 不再把这些内容压成一段文本，也不要求模型补写专有结果 JSON；
+它将文本和非文本内容分别投射为 BackendPort 的 `content` 与
+`artifacts`。只有 `stopReason=end_turn` 代表回合成功完成；取消、拒绝、Token 或
+Agent 请求次数耗尽分别进入 Gateway 的取消或失败路径。Gateway 再根据客户端能力
+决定对话展示、资源卡片和语音表达。
 
 已完成的结果优先返回到发起对话。在全新连接时，可以恢复同一 owner 的旧对话中
 未完成的结果。可续期声明防止两个实时前端呈现相同结果。结果被注入实时上下文，
@@ -191,45 +200,38 @@ Markdown、代码或链接，用于共享时间线。
 交付会等待并重试，不会重复注入上下文。重试有次数上限，因此一个格式异常的结果
 不会阻塞后续完成。
 
-当后端 Agent 将工作交给另一个原生后端 Session 时，中间传输响应为：
+当后端 Agent 调用 `session_start` 或 `session_send` 时，委派成立的权威事实是
+Session 工具已经成功创建或续接目标任务，并返回 Adapter 验证过的运行与 Session
+标识，而不是模型输出的某个字段。ACP 只负责如实传递工具调用、工具结果和当前回合的
+终止；Adapter 将验证后的关联发布给 TaskManager，后者据此把原始 Task 移至
+`delegated`，并释放后端 Agent 串行化锁和 Task 调度通道。因此，其他语音请求可以在
+目标 Session 运行期间使用协调器。
 
-```json
-{
-  "work_id": "work id",
-  "state": "delegated",
-  "mode": "delegate",
-  "delegation_id": "opaque run id",
-  "target_session_id": "opaque backend Session id",
-  "presentation": {
-    "speech": "a natural confirmation authored by the backend Agent",
-    "inline": null
-  }
-}
-```
+协调 Agent 可以在工具成功后自然结束当前 ACP 回合，但该文本不控制任务状态，也不会
+被解释为完成信号。关联 ID、目标 Session 和生命周期完全保留在 Gateway 的 Task
+Registry 与 Adapter 运行时中，不要求模型回显。
 
-此响应绝不是用户可见的完成。适配器立即让后端 Agent 自然地完成这个简短的
-工具后响应，将原始 Work 移至 `delegated`，并释放后端 Agent 串行化锁和
-Work 调度通道。因此，其他语音请求可以在目标 Session 运行期间使用协调器。
-适配器独立地保持 Work 生命周期和事件订阅存活。只有与委派 ID 关联的匹配 ACP
-目标提示完成才能完成 Work。然后适配器短暂重新获取后端 Agent 锁，并将经验证的
-结果发送给它进行最终呈现。繁忙的目标、空结果、无关的 Session 更新或旧结果
-都无法完成 Work。
+适配器独立地保持 Task 生命周期和事件订阅存活。只有与委派 ID 关联的匹配 ACP
+目标提示完成才能完成 Task。然后适配器短暂重新获取后端 Agent 锁，并将经验证的
+结果及其原生 ContentBlock 发送给它整理最终答复。繁忙的目标、空结果、无关的
+Session 更新或旧结果
+都无法完成 Task。
 
-正常的后端请求超时分别适用于初始协调器轮次和最终呈现轮次。当适配器在等待
-委派 Session 时不适用该超时。在该间隔内，只有显式 Work 取消或后端关闭才会
-取消目标 Session。
+ACP Agent 轮次不设人为墙钟超时。初始协调轮次、委派目标轮次和最终整理轮次，
+只会在 ACP 报告完成、用户显式取消 Task，或后端进程退出/关闭时结束。连接初始化
+和有界控制 RPC 仍保留超时，避免不可用的后端无限阻塞 Gateway 启动。
 
-取消是确认式的，而非乐观式的。`queued` Work 在本地取消。`running` 或
-`finalizing` Work 中止其活跃后端请求。对于 `delegated` Work，首先请求空闲的
+取消是确认式的，而非乐观式的。`queued` Task 在本地取消。`running` 或
+`finalizing` Task 中止其活跃后端请求。对于 `delegated` Task，首先请求空闲的
 协调器调用 `session_cancel`；如果协调器 Session 被占用，ACP 适配器直接向精确
-关联的目标 Session 发送 `session/cancel`。Work 保持 `cancelling` 状态，
+关联的目标 Session 发送 `session/cancel`。Task 保持 `cancelling` 状态，
 直到其中一条路径确认停止，然后变为 `cancelled`。停止失败则变为 `failed` 并
 附带取消错误。在适配器直接中止后，Gateway 会记录一个取消事实，并在下一个安全的
 协调器轮次中注入一次。这样可以在不延迟取消或重复停止的情况下协调协调器的历史。
 
-委派的 `presentation` 由后端 Agent 使用正常推理编写，并作为开始确认立即播报。
-它可以解释创建了什么、提交了什么或计划了什么，但它不是最终结果。适配器仅在
-异步 Session 工具已经成功但后端轮次未能完成时，作为超时回退中止后端轮次。
+前台的受理确认来自 Gateway 已经创建的 Task，而不是协调 Agent 自报的委派状态。
+协调轮次仍依 ACP 生命周期信号自然结束；Gateway 不会根据受理文本或 Session
+工具调用成功来推断该轮次已完成。
 
 ## 8. 后端内部能力
 
@@ -239,6 +241,14 @@ send、status 和 cancel。OpenClaw ACP 不接受客户端提供的 MCP 服务�
 因此相同的协调契约映射到 OpenClaw 的原生 Session 工具。`session_start`
 和 `session_send` 返回不透明的委派 ID。在任一成功后，后端 Agent 不得轮询、
 重复工作或从自己的上下文中回答；适配器负责等待、取消、权限路由和结果关联。
+
+协调 MCP Server 还会通过 MCP 初始化响应的 `instructions` 字段发布稳定协调契约。
+后台 Driver 只有在确认 Agent Host 会把 MCP Server instructions 投射进模型上下文后，
+才声明 `coordinatorMcpInstructions`；这些后台每轮只接收动态自然任务指令，避免把
+相同的路由与返回规则反复追加到持久 Session 历史。目前已确认 OpenCode、Qoder、Qwen Code
+和 Claude Code，并将共享内容控制在 2 KiB 的可移植预算内。尚未验证的后台，或未来
+超过预算的内容，继续使用完整的逐轮 Prompt 安全回退。该标志不表示后台是否普遍支持
+MCP。项目 Session 不会连接协调 MCP Server。
 
 `session_status` 仅用于观察。如果查询失败，后端 Agent 必须报告失败；
 不得使用原生工具检查目标目录或复制委派的工作。
@@ -253,23 +263,28 @@ WebUI / TUI / Desktop
    ↓ WebSocket and HTTP
 Realtime Gateway
    ↓ spawn_thinking
-Work queue
+Task queue
    ↓
-backend agent envelope
+结构化 BackendPort Task
    ↓
-Shared ACP adapter
+Adapter 投影：自然任务指令 + 原生附件 Part
    ↓
 OpenCode ACP, OpenClaw ACP bridge, Qoder ACP,
 Qwen Code ACP, Kimi Code ACP, or another ACP Agent
 ```
 
 后端特定的 API 细节仅属于 `server/src/agent`。实时工具不得导入后端适配器。
-UI 仅消费公共 Work 事件和最终时间线内容。包级别的 `shared` 模块是基础运行时
+UI 仅消费公共 Task 与对话事件。包级别的 `shared` 模块是基础运行时
 工具；server `core` 和 `process` 可以依赖它们，但它们不得依赖 server 层。
 
 Gateway 可以将不可变的 `web/dist` 产物作为部署便利来提供，但这仅是静态托管。
 Gateway 源码不得导入 UI 组件、呈现文本、样式、终端行为或桌面行为。
 所有三个 UI 拥有自己的渲染，并将结构化协议字段映射到各自的标签和交互模式。
+
+后台 Task 播报只保留一个代码级装配接缝：嵌入方可以向
+`createGatewayApplication` 传入 `taskAnnouncementFactory`。默认 factory 原样组合
+现有的最终结果播报与低频进度播报管理器；场景方也可以整体替换两者。这是产品代码的
+依赖注入点，不是用户设置、策略注册表或新的线上协议。
 
 ## 10. 进程所有权
 
@@ -282,7 +297,7 @@ Gateway 是唯一的核心产品服务。后台生命周期由共享的 `owned/e
 
 后台服务归属与 ACP 连接方式是两个相互独立的维度。每个后台 profile 声明一个
 `acpConnection`；连接工厂当前实现 `process`，即启动一个本地 ACP stdio 子进程。
-未来的远程 ACP bridge 可以新增另一种连接类型，而无需修改协调、权限、Work 或
+未来的远程 ACP bridge 可以新增另一种连接类型，而无需修改协调、权限、Task 或
 Session 生命周期代码。声明外部后台服务，并不意味着 ACP 连接也自动变成远程连接。
 
 每个后台通过一份经过校验的 Plugin 契约注册。目录项统一拥有身份、安装、原生配置
@@ -334,5 +349,5 @@ macOS 桌面渲染器打包在应用程序内部。Electron 从私有的随机�
 4. 工具事件是否仅用于通用 UI 进度？
 5. 完成播报是否仅来自最终后端 Agent 结果？
 6. 任何 UI 是否开始管理 Gateway 或后端进程？
-7. 打断是否能在不取消已提交 Work 的情况下推迟语音？
+7. 打断是否能在不取消已提交 Task 的情况下推迟语音？
 8. 测试是否覆盖 FIFO 串行化、固定 Session 复用、工具动画和交付重试？

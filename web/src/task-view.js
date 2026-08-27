@@ -12,8 +12,23 @@ export function phaseForTask(task) {
   if (task.status === 'delegated') return 'delegated'
   if (task.status === 'finalizing') return 'finalizing'
   if (task.status === 'cancelling') return 'cancelling'
-  if (task.workState === 'active') return 'running'
+  if (['working', 'auth_required', 'active'].includes(task.workState)) {
+    return 'running'
+  }
   return 'running'
+}
+
+export function taskIsActive(task) {
+  return ['submitted', 'working', 'auth_required', 'active']
+    .includes(task?.workState)
+}
+
+export function taskNeedsPresentation(task) {
+  if (taskIsActive(task)) return true
+  return (
+    ['completed', 'failed'].includes(task?.status)
+    && ['pending', 'delivering'].includes(task?.notificationStatus)
+  )
 }
 
 export function removeDeliveredTask(tasks, taskId) {
@@ -51,19 +66,19 @@ function latestVisibleActivity(activity = []) {
   const visible = activity.filter(item => (
     item
     && item.tool !== 'invalid'
-    && !(
-      item.kind === 'text'
-      && String(item.text || '').trim().startsWith('<qwen_audio_agent_request>')
-    )
   ))
-  return visible.findLast(item => (
+  const activeTool = visible.findLast(item => (
     item.kind === 'tool'
     && !['completed', 'failed'].includes(item.status)
   ))
-    || visible.findLast(item => item.kind === 'plan' && item.status === 'running')
-    || visible.findLast(item => item.kind === 'tool')
+  if (activeTool) return activeTool
+  const activePlan = visible.findLast(
+    item => item.kind === 'plan' && item.status === 'running',
+  )
+  if (activePlan) return activePlan
+  return visible.findLast(item => item.kind === 'tool')
     || visible.findLast(item => item.kind === 'plan')
-    || visible.at(-1)
+    || null
 }
 
 export function taskDetail(task) {
@@ -78,12 +93,13 @@ export function taskDetail(task) {
   if (task.phase === 'responding') return t('结果已经返回，正在准备语音回复')
   if (task.phase === 'completed') return task.result || t('结果已经发送')
   if (task.phase === 'disconnected') return t('正在等待与后台重新连接')
+  const message = String(task.message || '').trim()
+  if (message) return message.slice(0, 300)
 
   const activity = latestVisibleActivity(task.activity)
   if (!activity) return task.phase === 'delegated'
     ? t('进行中')
-    : task.objective
-  if (activity.kind === 'session') return t('正在连接后台 Agent')
+    : task.objective || t('正在执行任务')
   if (activity.kind === 'plan') {
     const count = activity.total > 0
       ? `${activity.completed}/${activity.total}`
@@ -91,9 +107,6 @@ export function taskDetail(task) {
     return [count, activity.detail].filter(Boolean).join(' · ')
       || t('正在执行任务')
   }
-  if (activity.kind === 'text') return task.phase === 'delegated'
-    ? t('进行中')
-    : t('正在整理结果')
   if (activity.kind === 'tool') {
     if (activity.label) return activity.label
     if (activity.category === 'image') return t('正在生成图片')
@@ -145,6 +158,15 @@ export function taskView(task, previous = {}) {
     result: Object.hasOwn(task, 'result')
       ? task.result
       : previous.result,
+    ...(
+      Object.hasOwn(task, 'message') || Object.hasOwn(previous, 'message')
+        ? {
+            message: Object.hasOwn(task, 'message')
+              ? task.message
+              : previous.message,
+          }
+        : {}
+    ),
     ...(
       Object.hasOwn(task, 'activity') || Object.hasOwn(previous, 'activity')
         ? { activity: task.activity || previous.activity || [] }

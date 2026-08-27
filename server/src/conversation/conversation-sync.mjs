@@ -1,3 +1,5 @@
+import { projectFrontendConversation } from './frontend-conversation-projection.mjs'
+
 function sessionKey(ownerId, sessionId) {
   return `${ownerId}\u0000${sessionId}`
 }
@@ -42,16 +44,23 @@ export class ConversationSync {
     maxMessages = 100,
     maxSessions = 500,
     sessionTtlMs = 6 * 60 * 60 * 1000,
+    onRecord = null,
   } = {}) {
     this.maxMessages = maxMessages
     this.maxSessions = maxSessions
     this.sessionTtlMs = sessionTtlMs
     this.sessions = new Map()
     this.sequence = 0
+    this.onRecord = onRecord
   }
 
   configureRetention(options = {}) {
     Object.assign(this, options)
+  }
+
+  setRecordObserver(observer) {
+    this.onRecord = typeof observer === 'function' ? observer : null
+    return this
   }
 
   state(ownerId, sessionId) {
@@ -88,7 +97,7 @@ export class ConversationSync {
     }
   }
 
-  record({
+  upsert({
     ownerId,
     sessionId,
     id,
@@ -99,7 +108,9 @@ export class ConversationSync {
     taskId = null,
     taskIds = [],
     inputs = [],
-  }) {
+    citations = [],
+    createdAt = null,
+  }, { notify = true } = {}) {
     const normalized = clean(content)
     if (!id || !normalized) return null
     const state = this.state(ownerId, sessionId)
@@ -114,7 +125,14 @@ export class ConversationSync {
         taskIds: [...new Set((taskIds || []).filter(Boolean))],
         inputs: (inputs || []).map(input => ({ ...input })),
       })
-      return { ...existing }
+      if (citations?.length) {
+        existing.citations = citations.map(citation => ({ ...citation }))
+      }
+      const snapshot = { ...existing }
+      if (notify) {
+        try { this.onRecord?.(snapshot, { ownerId, sessionId }) } catch { /* observers must not affect sync */ }
+      }
+      return snapshot
     }
     const message = {
       seq: ++this.sequence,
@@ -126,7 +144,10 @@ export class ConversationSync {
       taskId,
       taskIds: [...new Set((taskIds || []).filter(Boolean))],
       inputs: (inputs || []).map(input => ({ ...input })),
-      createdAt: Date.now(),
+      ...(citations?.length
+        ? { citations: citations.map(citation => ({ ...citation })) }
+        : {}),
+      createdAt: Number(createdAt) || Date.now(),
     }
     state.messages.push(message)
     state.byId.set(id, message)
@@ -134,7 +155,22 @@ export class ConversationSync {
       const removed = state.messages.shift()
       state.byId.delete(removed.id)
     }
-    return { ...message }
+    const snapshot = { ...message }
+    if (notify) {
+      try { this.onRecord?.(snapshot, { ownerId, sessionId }) } catch { /* observers must not affect sync */ }
+    }
+    return snapshot
+  }
+
+  record(message) {
+    return this.upsert(message)
+  }
+
+  restore({ ownerId, sessionId, messages = [] }) {
+    for (const message of messages) {
+      this.upsert({ ownerId, sessionId, ...message }, { notify: false })
+    }
+    return this.frontendContext({ ownerId, sessionId })
   }
 
   list({ ownerId, sessionId }) {
@@ -143,6 +179,9 @@ export class ConversationSync {
       .map(message => ({
         ...message,
         inputs: (message.inputs || []).map(input => ({ ...input })),
+        ...(message.citations
+          ? { citations: message.citations.map(citation => ({ ...citation })) }
+          : {}),
       }))
   }
 
@@ -162,27 +201,7 @@ export class ConversationSync {
   }
 
   frontendContext({ ownerId, sessionId }) {
-    const messages = this.list({ ownerId, sessionId })
-    const presentedTaskIds = new Set()
-    messages
-      .filter(message => message.source === 'agent-presentation')
-      .forEach(message => {
-        if (message.taskId) presentedTaskIds.add(message.taskId)
-        message.taskIds?.forEach(taskId => presentedTaskIds.add(taskId))
-      })
-    return messages.filter(message => (
-      [
-        'voice-user',
-        'text-user',
-        'realtime-direct',
-        'agent-presentation',
-      ].includes(message.source)
-      || (
-        message.source === 'agent-result'
-        && message.taskId
-        && !presentedTaskIds.has(message.taskId)
-      )
-    ))
+    return projectFrontendConversation(this.list({ ownerId, sessionId }))
   }
 
 }

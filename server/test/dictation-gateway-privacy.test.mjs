@@ -273,6 +273,7 @@ test('gateway rejects dictation START without active voice ownership', async t =
       hasEquivalentAssistantSpeech: () => false,
     },
     realtimeProviderRegistry: {
+      resolve: () => unavailableRealtimeProvider,
       resolveDictation: () => ({
         inputSampleRate: 16000,
         isConfigured: () => true,

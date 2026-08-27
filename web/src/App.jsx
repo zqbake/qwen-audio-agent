@@ -9,8 +9,8 @@ import {
 import {
   buildConversationTurns,
   discardUserTranscript,
-  finalAssistantContent,
-  insertByTurn,
+  mergeConversationHistory,
+  upsertAssistantTranscript,
   upsertUserTranscript,
 } from './message-order.js'
 import MessageContent from './MessageContent.jsx'
@@ -32,6 +32,7 @@ import {
   removeTaskInPhase,
   taskDeliverySettled,
   taskDetail,
+  taskNeedsPresentation,
   taskLabel,
   taskView,
 } from './task-view.js'
@@ -51,8 +52,7 @@ import {
   desktopHideDeadline,
   desktopWakeWordEnabled,
   desktopWorkSettled,
-  desktopTasksActive,
-  desktopTasksAttention,
+  desktopTasksWorking,
 } from './desktop-hide.js'
 import {
   desktopTaskCards,
@@ -107,7 +107,6 @@ function labelFor(state) {
     processing: t('正在处理'),
     speaking: t('正在说'),
     working: t('正在处理任务'),
-    attention: t('等待你的确认'),
     starting: t('正在启动'),
     connecting: t('正在连接语音前台'),
     occupied: t('其他入口正在使用'),
@@ -223,9 +222,16 @@ export default function App() {
   const workSettledAtRef = useRef(workSettledAt)
   const lastWakeAtRef = useRef(0)
   const dictationEventId = useRef(0)
-  const orbVisualStateRef = useRef('idle')
   const previousDesktopLifecycle = useRef('active')
+  const sessionIdRef = useRef(sessionId)
+  sessionIdRef.current = sessionId
   const spriteAnimationCue = spriteAnimationCues[0] || null
+
+  useEffect(() => {
+    const persistSession = window.qwenAudioAgentDesktop?.setConversationSession
+    if (!desktopOrbMode || typeof persistSession !== 'function') return
+    void persistSession(sessionId).catch(() => {})
+  }, [sessionId])
 
   const noteInteraction = useCallback(() => {
     setLastInteractionAt(Date.now())
@@ -410,58 +416,16 @@ export default function App() {
     activeVoiceResponse.current = responseId
     const id = `voice:${responseId}`
     const trackedTurnId = responseTurnMap.current.get(responseId) || event.turnId || currentTurnId.current
-    setMessages(items => {
-      const index = items.findIndex(item => item.id === id)
-      if (index < 0) return insertByTurn(items, {
-          id,
-          role: 'assistant',
-          content: final
-            ? finalAssistantContent(event.content)
-            : event.content || '',
-          turnId: trackedTurnId,
-          taskId: event.taskId,
-          taskIds: event.taskIds,
-          origin: event.origin,
-          deliverySequence: event.deliverySequence,
-          live: !final,
-      })
-      const next = [...items]
-      next[index] = {
-        ...next[index],
-        content: final
-          ? finalAssistantContent(event.content, next[index].content)
-          : next[index].content + (event.content || ''),
-        turnId: trackedTurnId || next[index].turnId,
-        taskId: event.taskId || next[index].taskId,
-        taskIds: event.taskIds || next[index].taskIds,
-        origin: event.origin || next[index].origin,
-        deliverySequence: event.deliverySequence || next[index].deliverySequence,
-        live: !final,
-      }
-      return next
-    })
-  }, [])
-
-  const updateTimelineItem = useCallback(item => {
-    if (!item?.content) return
-    setMessages(items => {
-      const id = `inline:${item.id || item.taskId || crypto.randomUUID()}`
-      const existing = items.findIndex(message => message.id === id)
-      const message = {
-        id,
-        role: 'assistant',
-        content: item.content,
-        title: item.title,
-        turnId: item.turnId || currentTurnId.current,
-        taskId: item.taskId,
-        companion: true,
-        final: true,
-      }
-      if (existing < 0) return insertByTurn(items, message)
-      const next = [...items]
-      next[existing] = message
-      return next
-    })
+    setMessages(items => upsertAssistantTranscript(items, {
+      id,
+      content: event.content,
+      turnId: trackedTurnId,
+      taskId: event.taskId,
+      taskIds: event.taskIds,
+      origin: event.origin,
+      citations: event.citations,
+      final,
+    }))
   }, [])
 
   const onRealtimeEvent = useCallback(event => {
@@ -476,10 +440,7 @@ export default function App() {
       }))
     }
     const animationEvent = spriteAnimationEventForGatewayEvent(event)
-    if (
-      animationEvent
-      && !(animationEvent === 'query' && orbVisualStateRef.current === 'processing')
-    ) {
+    if (animationEvent) {
       triggerSpriteAnimation(animationEvent)
     }
     if (event.type === 'turn.started') {
@@ -518,6 +479,13 @@ export default function App() {
       window.qwenAudioAgentDesktop?.wake()
     }
     if (event.type === 'gateway.connected') {
+      fetch(`api/conversations/${encodeURIComponent(sessionId)}/messages`)
+        .then(response => response.ok ? response.json() : Promise.reject())
+        .then(payload => {
+          if (sessionIdRef.current !== sessionId) return
+          setMessages(items => mergeConversationHistory(items, payload.messages))
+        })
+        .catch(() => {})
       fetch(`api/tasks?sessionId=${encodeURIComponent(sessionId)}`)
         .then(response => response.ok ? response.json() : Promise.reject())
         .then(payload => {
@@ -538,19 +506,13 @@ export default function App() {
             })
             serverTasks
               .filter(task => (
-                task.workState === 'active'
+                taskNeedsPresentation(task)
                 && !known.has(task.id)
               ))
               .reverse()
               .forEach(task => reconciled.push(taskView(task)))
             return reconciled
           })
-        })
-        .catch(() => {})
-      fetch(`api/timeline?sessionId=${encodeURIComponent(sessionId)}`)
-        .then(response => response.ok ? response.json() : Promise.reject())
-        .then(payload => {
-          for (const item of payload.items || []) updateTimelineItem(item)
         })
         .catch(() => {})
     }
@@ -599,9 +561,6 @@ export default function App() {
     }
     if (event.type === 'transcript.discard' && event.role === 'user') {
       setMessages(items => discardUserTranscript(items, event.turnId))
-    }
-    if (event.type === 'timeline.inline' && event.item?.content) {
-      updateTimelineItem(event.item)
     }
     if (event.type === 'response.started') {
       activeVoiceResponse.current = event.responseId
@@ -677,6 +636,15 @@ export default function App() {
         progress.id,
         task => taskView(progress, task),
         taskView(progress),
+      ))
+    }
+    if (event.type === 'task.updated') {
+      const task = event.task
+      setAgentTasks(items => upsertTask(
+        items,
+        task.id,
+        current => taskView(task, current),
+        taskView(task),
       ))
     }
     if (event.type === 'task.delegated') {
@@ -792,7 +760,6 @@ export default function App() {
     }
   }, [
     sessionId,
-    updateTimelineItem,
     updateUserTranscript,
     updateVoiceMessage,
     noteInteraction,
@@ -845,10 +812,10 @@ export default function App() {
     realtime: desktopRealtimeRuntime(voice.connectionState),
     backend: desktopBackendRuntime(backend),
   })
-  const desktopHasActiveTasks = desktopOrbMode && desktopTasksActive(agentTasks)
+  const desktopHasWorkingTasks = desktopOrbMode && desktopTasksWorking(agentTasks)
   // 统一视觉状态仲裁：生命周期 → 异常 → 对话态 → 后台态。
-  // 后台任务态（attention/working）仅在桌面悬浮球展示，
-  // WebUI 由任务卡片承载同类信息。
+  // 后台工作态仅在桌面悬浮球展示；等待授权由播报和任务卡片承载，
+  // 不占用 Agent 动画状态。WebUI 也由任务卡片承载同类信息。
   const orbVisualState = resolveOrbVisualState({
     lifecycle: desktopLifecycle,
     runtimeState: desktopOrbMode ? desktopRuntime.overall : null,
@@ -858,11 +825,9 @@ export default function App() {
       && voice.connectionState === 'connecting',
     ownershipBusy: voice.ownership.state === 'busy',
     voiceState: voice.visualState || voice.state,
-    tasksActive: desktopHasActiveTasks,
-    attentionPending: desktopOrbMode && desktopTasksAttention(agentTasks),
+    tasksWorking: desktopHasWorkingTasks,
   })
-  orbVisualStateRef.current = orbVisualState
-  const attentionTask = agentTasks.find(
+  const authorizationTask = agentTasks.find(
     task => task.authorization?.status === 'pending',
   )
 
@@ -1169,8 +1134,8 @@ export default function App() {
           desktopLifecycle === 'waking'
             ? t('正在显示悬浮球')
             : voice.error
-          || (orbVisualState === 'attention' && attentionTask
-            ? taskDetail(attentionTask)
+          || (orbVisualState === 'idle' && authorizationTask
+            ? taskDetail(authorizationTask)
             : orbVisualState === 'occupied' && ownershipLabel
               ? t('{holder}正在使用语音', { holder: ownershipLabel })
               : labelFor(orbVisualState))
@@ -1191,7 +1156,7 @@ export default function App() {
               <DesktopSpriteOrb
                 skin={orbSkinId}
                 state={orbVisualState}
-                baseWorking={desktopHasActiveTasks}
+                baseWorking={desktopHasWorkingTasks}
                 dragDirection={orbDragDirection}
                 cue={spriteAnimationCue}
                 onCueComplete={completeSpriteAnimationCue}
@@ -1328,7 +1293,9 @@ export default function App() {
             'always',
           )}
         >
-          {agentTask.authorization.submitting ? t('正在提交') : t('始终允许')}
+          {agentTask.authorization.submitting
+            ? t('正在提交')
+            : t('本会话始终允许')}
         </button>
         <button
           className="permission-deny"
@@ -1360,6 +1327,7 @@ export default function App() {
       role={message.role}
       content={message.content}
       live={message.live}
+      citations={message.citations}
     />
     {message.interrupted && <small className="interrupted">{t('已打断')}</small>}
   </article>

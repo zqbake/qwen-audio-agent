@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { AgentClient } from '../src/agent/agent-client.mjs'
+import {
+  AgentClient,
+  createAgentClient,
+} from '../src/agent/agent-client.mjs'
 
 function fakeAcpClient() {
   return {
     start: async () => ({
-      agentCapabilities: { sessionCapabilities: { resume: {} } },
+      agentCapabilities: {
+        sessionCapabilities: { resume: {} },
+        mcpCapabilities: { http: true },
+      },
     }),
     newSession: async options => ({
       sessionId: 'ses-current',
@@ -18,7 +24,7 @@ function fakeAcpClient() {
       response: {},
     }),
     prompt: async () => ({
-      content: '{"work_id":"one","state":"completed","mode":"respond","presentation":{"speech":"done","inline":null}}',
+      content: 'done',
       response: { stopReason: 'end_turn' },
     }),
     close: async () => {},
@@ -41,7 +47,7 @@ function fakeToolServer() {
 }
 
 test('selects one shared ACP adapter for OpenCode', () => {
-  const client = new AgentClient({
+  const client = createAgentClient({
     protocol: 'opencode',
     backends: {
       opencode: {
@@ -61,7 +67,7 @@ test('selects one shared ACP adapter for OpenCode', () => {
 })
 
 test('opens the active OpenCode ACP coordinator Session directly', async () => {
-  const client = new AgentClient({
+  const client = createAgentClient({
     protocol: 'opencode',
     model: '',
     backends: {
@@ -74,9 +80,12 @@ test('opens the active OpenCode ACP coordinator Session directly', async () => {
     acpClient: fakeAcpClient(),
     sessionToolServer: fakeToolServer(),
   })
-  await client.runCoordinator('test', {
+  await client.submit({
+    id: 'one',
+    taskId: 'one',
     ownerId: 'owner-one',
-    coordinationRunId: 'one',
+    originalRequest: 'test',
+    objective: 'test',
   })
   assert.equal(
     await client.uiUrl({ ownerId: 'owner-one' }),
@@ -97,7 +106,7 @@ for (const protocol of [
   'acp',
 ]) {
   test(`selects ${protocol} through the same ACP adapter`, () => {
-    const client = new AgentClient({
+    const client = createAgentClient({
       protocol,
       backends: {
         openclaw: {
@@ -131,7 +140,7 @@ for (const protocol of [
 }
 
 test('does not leak opencode coordinatorAgent to drivers without a coordinatorAgent', () => {
-  const client = new AgentClient({
+  const client = createAgentClient({
     protocol: 'qoder',
     backends: {
       opencode: { coordinatorAgent: 'opencode-coordinator' },
@@ -145,7 +154,7 @@ test('does not leak opencode coordinatorAgent to drivers without a coordinatorAg
 })
 
 test('handles null backends option gracefully', () => {
-  const client = new AgentClient({
+  const client = createAgentClient({
     protocol: 'opencode',
     backends: null,
     sessionStatePath: null,
@@ -153,4 +162,28 @@ test('handles null backends option gracefully', () => {
     sessionToolServer: fakeToolServer(),
   })
   assert.equal(client.protocol, 'opencode')
+})
+
+test('AgentClient owns exactly one injected backend instance', () => {
+  const adapter = {
+    protocol: 'test',
+    label: 'Test',
+    describe: () => ({ protocol: 'test' }),
+    start: async () => {},
+    health: async () => ({ ok: true }),
+    submit: async () => ({}),
+    status: () => ({ ok: true }),
+    cancel: async () => ({}),
+    respondAuthorization: async () => ({}),
+    subscribe: () => () => {},
+    close: async () => {},
+  }
+  const client = new AgentClient({ adapter })
+  assert.equal(client.adapter, adapter)
+  assert.equal(client.protocol, 'test')
+  assert.deepEqual(client.describe(), { protocol: 'test' })
+  assert.throws(
+    () => new AgentClient(),
+    /AgentClient adapter must be an object/,
+  )
 })

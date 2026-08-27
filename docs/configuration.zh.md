@@ -106,6 +106,42 @@ DEEPSEEK_HARNESS_MODEL=deepseek-v4-pro
 DASHSCOPE_API_KEY=your-key
 ```
 
+语音前台的 `web_search` 工具返回可核验的来源链接，不会创建后台 Agent 工作，也不会
+额外调用文本大模型。用户未配置时，默认使用无需 Key、国内可访问的简易 360 搜索
+Adapter，只解析一次公开搜索结果页。该基础兜底属于实验性实现，可能被拦截、结果质量
+不稳定或受上游变化影响；稳定使用时应配置自己的 Provider。
+
+在百炼开通联网搜索 MCP 后，需要显式选择内置预设；此时会复用
+`DASHSCOPE_API_KEY`：
+
+```dotenv
+QWEN_AUDIO_WEB_SEARCH_PROVIDER=bailian
+```
+
+同一个与供应商无关的 Adapter 也可以接入其他兼容的 MCP 搜索服务；自定义地址必须
+显式提供自己的凭据：
+
+```dotenv
+QWEN_AUDIO_WEB_SEARCH_PROVIDER=mcp
+QWEN_AUDIO_WEB_SEARCH_MCP_URL=https://example.com/mcp
+QWEN_AUDIO_WEB_SEARCH_MCP_TOKEN=your-token
+QWEN_AUDIO_WEB_SEARCH_MCP_TOOL=web_search
+```
+
+设置 `QWEN_AUDIO_WEB_SEARCH_PROVIDER=none` 可以关闭前台联网搜索。
+
+通用 Chatbot 工具可以通过前台 MCP Client 接入。用
+`QWEN_AUDIO_FRONTEND_MCP_CONFIG` 指定带版本的 JSON 文件并逐个启用；可写操作
+需要用户确认。详见[前台 MCP Client](reference/frontend-mcp.zh.md)。
+
+具有 OpenAPI 3.x 文档的 REST 服务，通过
+`QWEN_AUDIO_FRONTEND_OPENAPI_CONFIG` 复用同一套工具和授权边界。详见
+[前台 OpenAPI Tool Adapter](reference/frontend-openapi.zh.md)。
+需要把助手画像、MCP 和 OpenAPI 工具配置作为一套本地前台组合时，可以只设置
+`QWEN_AUDIO_FRONTEND_PROFILE`。详见[轻量 Frontend Profile](reference/frontend-profile.zh.md)。
+WebUI 和终端客户端会在最终回答下方展示规范化的来源链接；其他客户端可通过
+Gateway 的 `messages.citations` 能力位消费同一字段。
+
 需要执行后台任务时，再选择后台 Agent（以 OpenClaw 为例）：
 
 ```dotenv
@@ -346,6 +382,10 @@ ACP_WORKSPACE=
 通用入口由 Gateway 直接管理 ACP 子进程。`ACP_ARGS` 推荐写成
 JSON 字符串数组，以便参数中包含空格时仍能准确解析。它使用标准 ACP Session 和
 Gateway 提供的 Session MCP 工具，不假设某个 Agent 私有的启动、权限或 UI 能力。
+
+不提供 ACP 的办事系统可以在自定义 Node 启动器中实现 `BackendPort`，详见
+[Backend Adapter SDK](reference/backend-adapter-sdk.zh.md)。SDK 接入不新增
+`AGENT_PROTOCOL` 名称，也不会让配置文件动态加载任意代码。
 
 ### Hermes
 
@@ -716,13 +756,20 @@ Gateway 时，或后续 CLI 运行时使用了冲突的已配置模型时，会�
 | `QWEN_AUDIO_AGENT_ACP_FORWARD_ENV` | 空；仅供通用 ACP 显式传递的环境变量名，逗号分隔 |
 | `QWEN_AUDIO_REALTIME_MODEL` | `qwen-audio-3.0-realtime-plus` |
 | `QWEN_AUDIO_REALTIME_PROVIDER` | `dashscope` |
+| `QWEN_AUDIO_WEB_SEARCH_PROVIDER` | `so360`；可选 `bailian`、`bing`、`mcp` 或 `none` |
+| `QWEN_AUDIO_WEB_SEARCH_MCP_URL` | 空；`mcp` Provider 使用的自定义 Streamable HTTP 地址 |
+| `QWEN_AUDIO_WEB_SEARCH_MCP_TOKEN` | 显式选择 `bailian` 时复用 `DASHSCOPE_API_KEY`；自定义地址默认空 |
+| `QWEN_AUDIO_WEB_SEARCH_MCP_TOOL` | `bailian` 为 `bailian_web_search`，其他地址为 `web_search` |
+| `QWEN_AUDIO_FRONTEND_PROFILE` | 空；轻量 Frontend Profile JSON 文件路径 |
+| `QWEN_AUDIO_FRONTEND_MCP_CONFIG` | 空；前台 MCP 版本化 JSON 文件的绝对路径 |
+| `QWEN_AUDIO_FRONTEND_OPENAPI_CONFIG` | 空；前台 OpenAPI 版本化 JSON 配置文件的绝对路径 |
 | `QWEN_AUDIO_REALTIME_VOICE` | 空；Audio 模型族的可选覆盖，未设置时运行时使用 `longanqian` |
 | `QWEN_OMNI_REALTIME_VOICE` | 空；Omni 模型族的可选覆盖，未设置时运行时使用 `Ethan` |
 | `SPEECH_TO_SPEECH_REALTIME_URL` | `ws://127.0.0.1:8765/v1/realtime` |
 | `SPEECH_TO_SPEECH_AUTH_TOKEN` | 空；仅用于带 Bearer 认证的代理 |
 | `QWEN_AUDIO_AGENT_IDENTITY_MODE` | `personal` |
 | `QWEN_AUDIO_AGENT_TUI_AUDIO_MODE` | `half` |
-| `AGENT_TIMEOUT_MS` | `300000` |
+| `AGENT_TIMEOUT_MS` | `300000`；ACP 连接初始化与有界控制请求的超时，不限制正在执行的 Agent 轮次 |
 
 macOS TUI 的 CoreAudio 辅助程序默认编译到
 `~/Library/Caches/qwaudio/tui/macos-voice-io`，无需额外配置。它在播报期间

@@ -169,6 +169,7 @@ const desktopSettingsStore = createSettingsStore({
   configDir: runtimeEnvironment.dataDirectory,
   uiStateDir: runtimeEnvironment.configDirectory,
 })
+let desktopConversationSessionId = desktopSettingsStore.conversationSession.load()
 const orbPlacement = createOrbPlacement({
   getDisplays: () => screen.getAllDisplays(),
   orbSize: { width: DESKTOP_ORB_WIDTH, height: DESKTOP_ORB_HEIGHT },
@@ -521,6 +522,7 @@ async function loadQwenAudioAgent(window) {
       wakeWordEnabled: settings.wakeWordEnabled,
       language: effectiveDesktopLanguage(settings.language, app.getLocale()),
       surfaceMode: desktopSurfaceMode,
+      sessionId: desktopConversationSessionId,
     }))
     clearTimeout(reconnectTimer)
     reconnectTimer = null
@@ -719,6 +721,10 @@ const orbShell = bindOrbShell({
     const selected = setDesktopSurfaceMode(mode)
     if (selected === 'panel') desktopPresence.wake('panel')
     return selected
+  },
+  onSetConversationSession: sessionId => {
+    desktopConversationSessionId = desktopSettingsStore.conversationSession.save(sessionId)
+    return desktopConversationSessionId
   },
   onQuit: () => app.quit(),
   onDragEnd: () => {

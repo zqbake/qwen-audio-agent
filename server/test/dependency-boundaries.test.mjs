@@ -8,13 +8,38 @@ const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../src')
 const projectRoot = resolve(sourceRoot, '../..')
 const sharedRoot = resolve(sourceRoot, '../../shared')
 const allowedDependencies = {
-  app: new Set(['agent', 'app', 'conversation', 'core', 'task', 'voice']),
+  app: new Set([
+    'agent',
+    'app',
+    'backend',
+    'conversation',
+    'core',
+    'frontend',
+    'providers',
+    'session',
+    'task',
+    'transport',
+    'voice',
+  ]),
   process: new Set(['process', 'shared']),
   core: new Set(['core', 'shared']),
-  agent: new Set(['agent', 'core', 'shared']),
+  frontend: new Set(['frontend']),
+  providers: new Set(['core', 'frontend', 'providers', 'shared']),
+  agent: new Set(['agent', 'backend', 'core', 'shared']),
+  backend: new Set(['backend', 'core', 'shared']),
   conversation: new Set(['conversation', 'core', 'shared']),
-  task: new Set(['agent', 'core', 'task']),
-  voice: new Set(['conversation', 'core', 'shared', 'task', 'voice']),
+  session: new Set(['session', 'shared']),
+  task: new Set(['agent', 'core', 'session', 'task']),
+  transport: new Set(['shared', 'task', 'transport']),
+  voice: new Set([
+    'conversation',
+    'core',
+    'frontend',
+    'shared',
+    'task',
+    'transport',
+    'voice',
+  ]),
 }
 
 function sourceFiles(directory) {
@@ -68,6 +93,20 @@ test('generic ACP and process cores do not bind to named backends', () => {
   const namedBackend = /\b(?:openclaw|opencode|qoder|qwen(?!-audio-agent)|kimi|hermes|codebuddy|codex|claude|pi)\b/i
   const violations = genericCoreFiles
     .filter(file => namedBackend.test(readFileSync(file, 'utf8')))
+    .map(file => relative(projectRoot, file))
+  assert.deepEqual(violations, [])
+})
+
+test('Gateway Work consumers use BackendPort instead of ACP coordinator APIs', () => {
+  const consumers = [
+    resolve(sourceRoot, 'backend/backend-work-runtime.mjs'),
+    resolve(sourceRoot, 'app/gateway-application.mjs'),
+    resolve(sourceRoot, 'voice/realtime-gateway.mjs'),
+    resolve(sourceRoot, 'voice/tools/tool-call-handler.mjs'),
+  ]
+  const privateAcpApi = /\b(?:runCoordinator|cancelWork|queryDelegatedWork|coordinatorUsesMcpInstructions)\b|from\s+['"][^'"]*acp-/
+  const violations = consumers
+    .filter(file => privateAcpApi.test(readFileSync(file, 'utf8')))
     .map(file => relative(projectRoot, file))
   assert.deepEqual(violations, [])
 })

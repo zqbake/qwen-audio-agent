@@ -46,10 +46,12 @@ test('keeps spawn_thinking as the stable asynchronous work protocol', () => {
   assert.equal(spawn.function.parameters.properties.input_refs.maxItems, 8)
   assert.match(
     spawn.function.parameters.properties.objective.description,
-    /忠实转达用户要做什么及其明确约束/,
+    /忠实、完整且自包含地转达用户要做什么及其明确约束/,
   )
-  assert.match(spawn.function.description, /不要重复提交已经覆盖的目标/)
-  assert.match(spawn.function.description, /duplicate 表示同一目标此前已提交/)
+  assert.ok(spawn.function.description.trim())
+  const instructions = buildFrontendInstructions()
+  assert.match(instructions, /不要重复提交已经覆盖的目标/)
+  assert.match(instructions, /duplicate.*同一目标此前已提交/)
 })
 
 function createQwenFrontend(options = {}) {
@@ -653,6 +655,36 @@ test('offers the sleep tool only to a client that advertises the state', () => {
   )
 })
 
+test('projects dynamic frontend tools into each realtime protocol shape', () => {
+  const dynamic = {
+    type: 'function',
+    function: {
+      name: 'mcp__documents__search',
+      description: 'Search configured documents.',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string' } },
+      },
+    },
+  }
+  const agentContext = { frontend: { tools: [dynamic] } }
+  const qwen = REALTIME_PROVIDERS.qwen.buildSession({
+    configured: false,
+    agentContext,
+  })
+  const s2s = REALTIME_PROVIDERS['speech-to-speech'].buildSession({
+    agentContext,
+  })
+
+  assert.deepEqual(qwen.tools.at(-1), dynamic)
+  assert.deepEqual(s2s.tools.at(-1), {
+    type: 'function',
+    name: dynamic.function.name,
+    description: dynamic.function.description,
+    parameters: dynamic.function.parameters,
+  })
+})
+
 test('adds an event id to realtime client events', () => {
   const frontend = createQwenFrontend()
   let sent
@@ -776,6 +808,8 @@ test('builds cache-friendly policy, identity, memory and reconnect context', () 
   assert.match(prompt, /“这次”、“今天”或“暂时”时才不保存/)
   assert.match(prompt, /清除冲突或归类错误的旧内容/)
   assert.match(prompt, /选择最直接且足够的处理方式/)
+  assert.match(prompt, /`spawn_thinking` 声明能力范围[\s\S]*统一的执行入口/)
+  assert.match(prompt, /必须调用它，不能提前声称“做不到”/)
   assert.match(prompt, /可通过已注册工具完成的事就是你的能力/)
   assert.match(prompt, /不要先说自己不能做/)
   assert.match(prompt, /不要因一次工具\s*调用而忽略其余请求/)
@@ -803,7 +837,8 @@ test('builds cache-friendly policy, identity, memory and reconnect context', () 
   assert.match(prompt, /# Voice interaction/)
   assert.match(prompt, /没有新信息时不要说话/)
   assert.match(prompt, /不要规定用户未要求的具体工具/)
-  assert.match(prompt, /\[COMPLETE\]/)
+  assert.match(prompt, /最终结果会通过单独的结果上下文到达/)
+  assert.doesNotMatch(prompt, /\[COMPLETE\]/)
   assert.doesNotMatch(prompt, /get_agent_tasks|reply_agent_permission/)
   assert.match(prompt, /respond_agent_permission/)
   assert.match(prompt, /<backend_permission_request>/)
@@ -852,21 +887,15 @@ test('builds cache-friendly policy, identity, memory and reconnect context', () 
     .tools.find(tool => (
       tool.function.name === SPAWN_THINKING_TOOL_NAME
     ))
-  assert.match(spawnThinking.function.description, /屏幕/)
-  assert.match(spawnThinking.function.description, /图片生成/)
-  assert.match(spawnThinking.function.description, /直接调用/)
-  assert.match(spawnThinking.function.description, /不要先否认能力/)
-  assert.match(spawnThinking.function.description, /阶段结果/)
-  assert.match(spawnThinking.function.description, /get_agent_task_status/)
+  assert.ok(spawnThinking.function.description.trim())
   assert.match(
     spawnThinking.function.parameters.properties.objective.description,
-    /忠实转达用户要做什么及其明确约束/,
+    /忠实、完整且自包含地转达用户要做什么及其明确约束/,
   )
   assert.match(
     spawnThinking.function.parameters.properties.objective.description,
-    /近期对话会随工作一并提供/,
+    /后台不会收到前台的完整对话、个性化偏好或长期记忆/,
   )
-  assert.match(spawnThinking.function.description, /继续、修改已有工作/)
   const status = REALTIME_PROVIDERS.qwen
     .buildSession({ configured: false })
     .tools.find(tool => tool.function.name === 'get_agent_task_status')
@@ -880,7 +909,7 @@ test('builds cache-friendly policy, identity, memory and reconnect context', () 
     .tools.find(tool => tool.function.name === 'cancel_agent_task')
   assert.match(cancel.function.description, /定时任务或提醒/)
   assert.match(cancel.function.description, /先调用 get_agent_task_status/)
-  assert.match(cancel.function.parameters.properties.job_id.description, /job_id/)
+  assert.match(cancel.function.parameters.properties.task_id.description, /task_id/)
   assert.equal(cancel.function.parameters.properties.all.type, 'boolean')
   assert.match(
     cancel.function.parameters.properties.all.description,
@@ -1229,6 +1258,43 @@ test('injects a completed work result into Qwen conversation with tools disabled
   })
 })
 
+test('injects progress with response-scoped presentation instructions', async () => {
+  const frontend = createQwenFrontend({
+    responseStartTimeoutMs: 50,
+    responseCompletionTimeoutMs: 50,
+  })
+  const sent = []
+  frontend.ready = true
+  frontend.send = payload => sent.push(payload)
+
+  const outcome = frontend.injectResult(
+    '<background_work_progress>正在整理来源</background_work_progress>',
+    'progress',
+    { taskId: 'task-progress', turnId: null },
+    { instructions: '只简短播报阶段进展，不要说已经完成。' },
+  )
+  await new Promise(resolve => setImmediate(resolve))
+  frontend.handleLifecycle({
+    type: 'conversation.item.created',
+    item: { ...sent[0].item, status: 'completed' },
+  })
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(
+    sent[1].response.instructions,
+    '只简短播报阶段进展，不要说已经完成。',
+  )
+  frontend.handleLifecycle({
+    type: 'response.created',
+    response: { id: 'response-progress' },
+  })
+  frontend.handleLifecycle({
+    type: 'response.done',
+    response: { id: 'response-progress', status: 'completed' },
+  })
+  assert.equal((await outcome).completed, true)
+})
+
 test('cancelling a response before response.created releases its queue entry', async () => {
   const frontend = createQwenFrontend()
   frontend.ready = true
@@ -1243,6 +1309,56 @@ test('cancelling a response before response.created releases its queue entry', a
     phase: 'start',
   })
   assert.equal(frontend.pendingResponses.length, 0)
+})
+
+test('cancelling an active response releases queued input without response.done', async () => {
+  const frontend = createQwenFrontend({
+    responseCancelGraceMs: 1,
+    responseStartTimeoutMs: 50,
+    responseCompletionTimeoutMs: 50,
+  })
+  frontend.ready = true
+  const sent = []
+  frontend.send = event => sent.push(event)
+
+  const interrupted = frontend.speak('旧播报')
+  await new Promise(resolve => setImmediate(resolve))
+  frontend.handleLifecycle({
+    type: 'response.created',
+    response: { id: 'response-interrupted' },
+  })
+
+  frontend.cancel()
+  const next = frontend.sendUserText('你好')
+  assert.deepEqual(await interrupted, {
+    cancelled: true,
+    phase: 'completion',
+  })
+
+  await new Promise(resolve => setTimeout(resolve, 5))
+  await new Promise(resolve => setImmediate(resolve))
+  const item = sent.find(event => (
+    event.type === 'conversation.item.create'
+    && event.item?.content?.[0]?.text === '你好'
+  ))
+  assert.ok(item)
+  frontend.handleLifecycle({
+    type: 'conversation.item.created',
+    item: { ...item.item, status: 'completed' },
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  frontend.handleLifecycle({
+    type: 'response.created',
+    response: { id: 'response-next' },
+  })
+  frontend.handleLifecycle({
+    type: 'response.done',
+    response: { id: 'response-next', status: 'completed' },
+  })
+  assert.deepEqual(await next, {
+    completed: true,
+    responseId: 'response-next',
+  })
 })
 
 test('cancels only the matching permission response', async () => {

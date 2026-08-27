@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+
 export class AnnouncementManager {
   constructor({
     getFrontend,
@@ -11,6 +13,7 @@ export class AnnouncementManager {
     acknowledgementTimeoutMs = 120000,
     maxRetryAttempts = 8,
     leaseRenewIntervalMs = 20000,
+    createTurnId = () => `gateway_${randomUUID().replaceAll('-', '')}`,
     onDelivered = () => {},
     onLeaseRenew = () => {},
     onRelease = () => {},
@@ -27,6 +30,7 @@ export class AnnouncementManager {
     this.acknowledgementTimeoutMs = acknowledgementTimeoutMs
     this.maxRetryAttempts = maxRetryAttempts
     this.leaseRenewIntervalMs = leaseRenewIntervalMs
+    this.createTurnId = createTurnId
     this.onDelivered = onDelivered
     this.onLeaseRenew = onLeaseRenew
     this.onRelease = onRelease
@@ -59,24 +63,20 @@ export class AnnouncementManager {
 
   completed(task) {
     this.queue(task.id, {
-      jobId: task.jobId,
       event: 'task.completed',
       status: 'completed',
       objective: task.objective,
       result: task.result,
-      turnId: task.turnId,
       completedAt: task.completedAt,
     })
   }
 
   failed(task) {
     this.queue(task.id, {
-      jobId: task.jobId,
       event: 'task.failed',
       status: 'failed',
       objective: task.objective,
       error: task.error,
-      turnId: task.turnId,
       completedAt: task.completedAt,
     })
   }
@@ -259,8 +259,7 @@ export class AnnouncementManager {
       // Only events actually represented in this bounded model input may be
       // acknowledged when playback ends. Remaining events stay pending.
       taskIds: queued.map(item => item.taskId),
-      turnIds: announcements.map(item => item.turnId).filter(Boolean),
-      deliverySequence: queued[0].sequence,
+      deliveryTurnId: this.createTurnId(),
       contextInjected: false,
       responseCompleted: false,
       retryRequested: false,
@@ -273,7 +272,14 @@ export class AnnouncementManager {
   }
 
   async deliver() {
-    if (this.closed || this.delivering || this.isDeliveryBlocked()) return
+    if (this.closed || this.delivering) return
+    if (this.isDeliveryBlocked()) {
+      // Playback completion normally flushes the queue again. Keep a delayed
+      // self-wakeup as well: a throttled renderer or a lost playback receipt
+      // must not leave a completed task parked in "replying" forever.
+      this.scheduleDelivery(this.retryBaseMs)
+      return
+    }
     const frontend = this.getFrontend()
     if (!frontend?.ready) {
       if (!this.activeBatch) this.activeBatch = this.createBatch()
@@ -293,11 +299,9 @@ export class AnnouncementManager {
         this.resultContextMaxChars,
       )
       const context = {
-        turnId: batch.turnIds.length === 1 ? batch.turnIds[0] : null,
-        turnIds: batch.turnIds,
+        turnId: batch.deliveryTurnId,
         taskId: batch.taskIds.length === 1 ? batch.taskIds[0] : null,
         taskIds: batch.taskIds,
-        deliverySequence: batch.deliverySequence,
       }
       const outcome = this.announceIntoContext && frontend.injectResult
         ? await frontend.injectResult(
@@ -374,22 +378,17 @@ export class AnnouncementManager {
 }
 
 export function formatWorkResults(announcements) {
-  const blocks = announcements.map((item, index) => [
-    `--- event ${index + 1} ---`,
-    `type: ${item.event}`,
-    `job_id: ${item.jobId}`,
-    item.objective ? `submitted_objective: ${item.objective}` : '',
-    item.completedAt ? `completed_at: ${new Date(item.completedAt).toISOString()}` : '',
+  const blocks = announcements.map(item => [
+    `task_id: ${item.taskId}`,
+    `状态: ${item.status}`,
+    item.objective ? `工作: ${item.objective}` : '',
     item.status === 'completed'
-      ? `result:\n${String(item.result || '').trim()}`
-      : `error:\n${String(item.error || '').trim()}`,
+      ? `结果: ${String(item.result || '').trim()}`
+      : `错误: ${String(item.error || '').trim()}`,
   ].filter(Boolean).join('\n'))
   return [
-    '[COMPLETE]',
-    '<qwen_audio_agent_work_results>',
-    '以下是先前提交工作的最终结果，不是用户的新请求。',
-    ...blocks,
-    '</qwen_audio_agent_work_results>',
+    '以下是你先前异步执行工作的最终更新，不是用户的新请求。请作为自己的工作结果自然告知用户，不要提后台 Agent、协议或 Task，也不要读出 task_id。',
+    ...blocks.map(block => `\n${block}`),
   ].join('\n')
 }
 

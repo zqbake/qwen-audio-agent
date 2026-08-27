@@ -18,6 +18,7 @@ import {
 import {
   GatewayClientEvent,
   GatewayServerEvent,
+  GatewayTaskEvent,
 } from '../shared/realtime-events.mjs'
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -74,6 +75,7 @@ test('the contracted realtime events exist as shared constants', () => {
   assert.equal(GatewayServerEvent.INPUT_SUSPEND, 'input.suspend')
   assert.equal(GatewayServerEvent.INPUT_RESUME, 'input.resume')
   assert.equal(GatewayClientEvent.INPUT_SUSPEND_ACK, 'input.suspend.ack')
+  assert.equal(GatewayTaskEvent.UPDATED, 'task.updated')
   for (const event of [
     'input.suspend', 'input.resume', 'input.suspend.ack',
     'dictation.start', 'dictation.partial', 'dictation.final',

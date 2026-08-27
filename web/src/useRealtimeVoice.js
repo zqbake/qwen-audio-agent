@@ -1,8 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import {
   GatewayClientEvent,
   GatewayServerEvent,
 } from '../../shared/realtime-events.mjs'
+import {
+  acceptsGatewayVoiceState,
+  createGatewayClientState,
+  reduceGatewayClientState,
+} from '../../shared/gateway-client-state.mjs'
 import { clientInputCapabilities } from '../../shared/client-input-capabilities.mjs'
 import { decodePcm, pcmBase64, resample } from './audio.js'
 import { confirmTrackedPlaybackStart } from './playback-lifecycle.js'
@@ -20,11 +25,7 @@ function socketUrl(sessionId) {
 }
 
 export function acceptsVoiceState(event, currentTurnId) {
-  return (
-    !event.turnId
-    || event.turnId === currentTurnId
-    || event.origin !== 'model'
-  )
+  return acceptsGatewayVoiceState(event, currentTurnId)
 }
 
 export function visualVoiceState(state) {
@@ -233,23 +234,26 @@ export default function useRealtimeVoice({
   onEvent,
   onInputError,
 }) {
-  const [state, setState] = useState('idle')
+  const [clientState, dispatchClientState] = useReducer(
+    reduceGatewayClientState,
+    undefined,
+    createGatewayClientState,
+  )
   const [inputReady, setInputReady] = useState(false)
   const [error, setError] = useState('')
   const [visualError, setVisualError] = useState(false)
-  const [connectionState, setConnectionState] = useState('connecting')
-  const [wakeWordActive, setWakeWordActive] = useState(false)
-  const [ownership, setOwnership] = useState({
-    state: 'available',
-    holder: null,
-  })
   const [dictationCapture, setDictationCaptureState] = useState(false)
   const [hostInputSuspended, setHostInputSuspended] = useState(false)
+  const {
+    connectionState,
+    ownership,
+    voiceState: state,
+    wakeWordActive,
+  } = clientState
   const eventRef = useRef(onEvent)
   const inputErrorRef = useRef(onInputError)
   const wakeWordOnlyRef = useRef(wakeWordOnly)
   const socketRef = useRef(null)
-  const connectionStateRef = useRef('connecting')
   const hasConnectedRef = useRef(false)
   const pendingManualInputsRef = useRef([])
   const audioRef = useRef(null)
@@ -272,6 +276,8 @@ export default function useRealtimeVoice({
     cursor: 0,
     sources: [],
     startTimers: new Map(),
+    endTimers: new Map(),
+    responseEnds: new Map(),
     startedResponses: new Set(),
     sourceCounts: new Map(),
     doneResponses: new Set(),
@@ -325,14 +331,7 @@ export default function useRealtimeVoice({
     }
   }, [])
 
-  const setRealtimeConnectionState = useCallback(next => {
-    connectionStateRef.current = next
-    if (next === 'connected') hasConnectedRef.current = true
-    setConnectionState(next)
-  }, [])
-
   const flushPendingManualInputs = useCallback(() => {
-    if (connectionStateRef.current !== 'connected') return
     const pending = pendingManualInputsRef.current
     if (pending.length) holdManualInputGuard()
     while (pending.length) {
@@ -355,10 +354,14 @@ export default function useRealtimeVoice({
     const playback = playbackRef.current
     const activeResponseIds = new Set([
       ...playback.startTimers.keys(),
+      ...playback.endTimers.keys(),
       ...playback.startedResponses,
       ...playback.sourceCounts.keys(),
     ])
     for (const timer of playback.startTimers.values()) {
+      clearTimeout(timer)
+    }
+    for (const timer of playback.endTimers.values()) {
       clearTimeout(timer)
     }
     for (const responseId of activeResponseIds) {
@@ -375,6 +378,8 @@ export default function useRealtimeVoice({
       cursor: 0,
       sources: [],
       startTimers: new Map(),
+      endTimers: new Map(),
+      responseEnds: new Map(),
       startedResponses: new Set(),
       sourceCounts: new Map(),
       doneResponses: new Set(),
@@ -391,6 +396,10 @@ export default function useRealtimeVoice({
       || (playback.sourceCounts.get(responseId) || 0) > 0
     ) return
     sendPlaybackEvent(GatewayClientEvent.PLAYBACK_ENDED, responseId)
+    const endTimer = playback.endTimers.get(responseId)
+    if (endTimer !== undefined) clearTimeout(endTimer)
+    playback.endTimers.delete(responseId)
+    playback.responseEnds.delete(responseId)
     playback.startedResponses.delete(responseId)
     playback.sourceCounts.delete(responseId)
     playback.doneResponses.delete(responseId)
@@ -402,6 +411,39 @@ export default function useRealtimeVoice({
     if (playback.failedResponses.delete(responseId)) return
     playback.doneResponses.add(responseId)
     finishPlaybackIfReady(responseId)
+    const responseEnd = playback.responseEnds.get(responseId)
+    if (
+      !playback.doneResponses.has(responseId)
+      || playback.endTimers.has(responseId)
+      || !Number.isFinite(responseEnd)
+    ) return
+    const checkTimelineFinished = () => {
+      const current = playbackRef.current
+      if (!current.endTimers.has(responseId)) return
+      const context = audioRef.current
+      const responseEnd = current.responseEnds.get(responseId)
+      if (
+        !context
+        || !Number.isFinite(responseEnd)
+        || context.state !== 'running'
+        || context.currentTime + 0.01 < responseEnd
+      ) {
+        const timer = setTimeout(checkTimelineFinished, 50)
+        current.endTimers.set(responseId, timer)
+        return
+      }
+      // AudioContext time has crossed the last scheduled sample. Treat that
+      // as a reliable fallback when Electron misses AudioBufferSource.onended.
+      current.sourceCounts.set(responseId, 0)
+      finishPlaybackIfReady(responseId)
+    }
+    const delay = Math.max(
+      0,
+      ((responseEnd || audioRef.current?.currentTime || 0)
+        - (audioRef.current?.currentTime || 0)) * 1000,
+    ) + 50
+    const timer = setTimeout(checkTimelineFinished, delay)
+    playback.endTimers.set(responseId, timer)
   }, [finishPlaybackIfReady])
 
   const failPlayback = useCallback((responseId, reason) => {
@@ -410,7 +452,11 @@ export default function useRealtimeVoice({
       playback.failedResponses.add(responseId)
       const timer = playback.startTimers.get(responseId)
       if (timer !== undefined) clearTimeout(timer)
+      const endTimer = playback.endTimers.get(responseId)
+      if (endTimer !== undefined) clearTimeout(endTimer)
       playback.startTimers.delete(responseId)
+      playback.endTimers.delete(responseId)
+      playback.responseEnds.delete(responseId)
       playback.startedResponses.delete(responseId)
       playback.sourceCounts.delete(responseId)
       playback.doneResponses.delete(responseId)
@@ -463,6 +509,10 @@ export default function useRealtimeVoice({
         playback.sourceCounts.set(
           responseId,
           (playback.sourceCounts.get(responseId) || 0) + 1,
+        )
+        playback.responseEnds.set(
+          responseId,
+          Math.max(playback.responseEnds.get(responseId) || 0, playback.cursor),
         )
       }
     } catch (reason) {
@@ -521,11 +571,17 @@ export default function useRealtimeVoice({
 
   useEffect(() => {
     if (suspended) {
-      setState('idle')
+      dispatchClientState({
+        type: GatewayServerEvent.VOICE_STATE,
+        state: 'idle',
+      })
+      dispatchClientState({
+        type: GatewayServerEvent.VOICE_CONNECTION,
+        state: 'hidden',
+      })
       setInputReady(false)
       setError('')
       setVisualError(false)
-      setRealtimeConnectionState('hidden')
       return undefined
     }
     let disposed = false
@@ -540,8 +596,9 @@ export default function useRealtimeVoice({
         reconnectDelay = 500
         setError('')
         setVisualError(false)
-        setRealtimeConnectionState('connecting')
-        eventRef.current?.({ type: GatewayServerEvent.GATEWAY_CONNECTED })
+        const connectedEvent = { type: GatewayServerEvent.GATEWAY_CONNECTED }
+        dispatchClientState(connectedEvent)
+        eventRef.current?.(connectedEvent)
         const mode = realtimeClientMode({
           enabled: enabledRef.current,
           inputReady: inputReadyRef.current,
@@ -576,16 +633,17 @@ export default function useRealtimeVoice({
         } catch {
           return
         }
+        dispatchClientState(event)
         if (event.type === GatewayServerEvent.VOICE_READY && event.inputSampleRate) {
           inputSampleRate.current = event.inputSampleRate
-          setRealtimeConnectionState('connected')
+          hasConnectedRef.current = true
           setError('')
           setVisualError(false)
           flushPendingManualInputs()
         }
         if (event.type === GatewayServerEvent.VOICE_CONNECTION) {
-          setRealtimeConnectionState(event.state || 'connecting')
           if (event.state === 'connected') {
+            hasConnectedRef.current = true
             setError('')
             setVisualError(false)
             flushPendingManualInputs()
@@ -593,25 +651,6 @@ export default function useRealtimeVoice({
             setError(event.message || t('语音前台连接异常，正在重试'))
             setVisualError(true)
           }
-        }
-        if (event.type === GatewayServerEvent.VOICE_SLEEP) {
-          if (event.state === 'enabled') {
-            setWakeWordActive(true)
-          } else if (event.state === 'disabled') {
-            setWakeWordActive(false)
-          }
-        }
-        if (event.type === GatewayServerEvent.VOICE_OWNERSHIP) {
-          setOwnership({
-            state: event.state || 'available',
-            holder: event.holder || null,
-          })
-        }
-        if (event.type === GatewayServerEvent.VOICE_DEACTIVATED) {
-          setOwnership({
-            state: 'busy',
-            holder: event.holder || null,
-          })
         }
         if (event.type === GatewayServerEvent.TURN_STARTED) {
           currentTurnId.current = event.turnId || ''
@@ -627,7 +666,6 @@ export default function useRealtimeVoice({
         }
         if (event.type === GatewayServerEvent.VOICE_STATE) {
           if (acceptsVoiceState(event, currentTurnId.current)) {
-            setState(event.state)
             if (event.state === 'listening') {
               stopPlayback('user_interruption')
             }
@@ -667,7 +705,10 @@ export default function useRealtimeVoice({
       }
       socket.onerror = () => {
         if (!disposed) {
-          setRealtimeConnectionState('unavailable')
+          dispatchClientState({
+            type: GatewayServerEvent.VOICE_CONNECTION,
+            state: 'unavailable',
+          })
           setError(t('实时语音连接中断，正在重连'))
           setVisualError(true)
         }
@@ -677,17 +718,22 @@ export default function useRealtimeVoice({
         if (disposed) return
         releaseManualInputGuard()
         stopPlayback()
-        setState('idle')
-        setRealtimeConnectionState('unavailable')
+        const disconnectedEvent = {
+          type: GatewayServerEvent.GATEWAY_DISCONNECTED,
+        }
+        dispatchClientState(disconnectedEvent)
         setError(t('实时语音连接中断，正在重连'))
         setVisualError(true)
-        eventRef.current?.({ type: GatewayServerEvent.GATEWAY_DISCONNECTED })
+        eventRef.current?.(disconnectedEvent)
         reconnectTimer = setTimeout(connect, reconnectDelay)
         reconnectDelay = Math.min(5000, reconnectDelay * 2)
       }
     }
     setError('')
-    setRealtimeConnectionState('connecting')
+    dispatchClientState({
+      type: GatewayServerEvent.VOICE_CONNECTION,
+      state: 'connecting',
+    })
     connect()
 
     return () => {
@@ -715,7 +761,6 @@ export default function useRealtimeVoice({
     sessionId,
     stopPlayback,
     suspended,
-    setRealtimeConnectionState,
     takeover,
   ])
 

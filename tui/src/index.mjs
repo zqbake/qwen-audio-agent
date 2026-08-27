@@ -6,12 +6,17 @@ import {
   GatewayServerEvent,
 } from '../../shared/realtime-events.mjs'
 import {
+  createGatewayClientState,
+  reduceGatewayClientState,
+} from '../../shared/gateway-client-state.mjs'
+import {
   displayInputText,
   inputFileParts,
   inputText,
 } from '../../shared/input-parts.mjs'
 import { createLogger } from '../../shared/logger.mjs'
 import { clientInputCapabilities } from '../../shared/client-input-capabilities.mjs'
+import { formatCitationLines } from '../../shared/citation-display.mjs'
 import { startMacVoiceIO } from './macos-voice-io.mjs'
 import { resamplePcm16 } from './pcm-audio.mjs'
 import { startPortAudioVoiceIO } from './portaudio-voice-io.mjs'
@@ -271,6 +276,23 @@ export function canSendMicrophoneAudio({
   captureEnabled,
 }) {
   return Boolean(connected && !muted && captureEnabled)
+}
+
+export function canStartTuiCapture({
+  clientState,
+  muted,
+  closed,
+  bridgeExited,
+  socketOpen,
+}) {
+  return Boolean(
+    !muted
+    && clientState?.voiceReady
+    && clientState?.ownership?.state === 'active'
+    && !closed
+    && !bridgeExited
+    && socketOpen,
+  )
 }
 
 export function performManualInterrupt({
@@ -1149,8 +1171,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
   let reconnectTimer = null
   let reconnectDelay = 500
   let connectedOnce = false
-  let frontendReady = false
-  let ownsVoice = false
+  let gatewayClientState = createGatewayClientState()
   let everOwnedVoice = false
   let captureEnabled = false
   let captureStateSent = false
@@ -1225,6 +1246,8 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     onAssistantDelta: content => transcriptRenderer.stream(assistantPrefix, content),
     onAssistant: (content, event) => {
       transcriptRenderer.finish(assistantPrefix, content)
+      const citations = formatCitationLines(event?.citations)
+      if (citations) print(style(citations, 'dim'))
       turnStatusDisplay.assistantFinished(event?.turnId)
     },
     onReset: () => {
@@ -1361,14 +1384,13 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
   })
 
   const startMicrophone = () => {
-    if (
-      muted
-      || !frontendReady
-      || !ownsVoice
-      || closed
-      || bridgeExited
-      || socket?.readyState !== WebSocket.OPEN
-    ) return
+    if (!canStartTuiCapture({
+      clientState: gatewayClientState,
+      muted,
+      closed,
+      bridgeExited,
+      socketOpen: socket?.readyState === WebSocket.OPEN,
+    })) return
     if (setCaptureEnabled(true)) {
       setStatus(`已连接 · 麦克风已开启 · ${audioMode.shortLabel}`)
       print(`[麦克风已开启 · ${inputSampleRate} Hz · ${audioMode.shortLabel}]`)
@@ -1398,7 +1420,16 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
   const dictationEnabled = (health.capabilities || []).includes('composer.dictation')
   dictationClient = new TuiComposerDictation({
     enabled: dictationEnabled,
-    canStart: () => !muted && ownsVoice && !hostInputSuspended && !closed,
+    canStart: () => (
+      !hostInputSuspended
+      && canStartTuiCapture({
+        clientState: gatewayClientState,
+        muted,
+        closed,
+        bridgeExited,
+        socketOpen: socket?.readyState === WebSocket.OPEN,
+      })
+    ),
     send: event => {
       if (socket?.readyState !== WebSocket.OPEN) return false
       socket.send(JSON.stringify(event))
@@ -1415,8 +1446,16 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
       dictationActive = false
       setCaptureEnabled(false)
       if (
-        restore && dictationPreviousCapture && !muted && ownsVoice
+        restore
+        && dictationPreviousCapture
         && !hostInputSuspended
+        && canStartTuiCapture({
+          clientState: gatewayClientState,
+          muted,
+          closed,
+          bridgeExited,
+          socketOpen: socket?.readyState === WebSocket.OPEN,
+        })
       ) setCaptureEnabled(true)
       dictationPreviousCapture = false
     },
@@ -1477,8 +1516,8 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     if (event.type === GatewayServerEvent.INPUT_RESUME) {
       hostInputSuspended = false
     }
+    gatewayClientState = reduceGatewayClientState(gatewayClientState, event)
     if (event.type === GatewayServerEvent.VOICE_READY) {
-      frontendReady = true
       const nextRate = Number(event.inputSampleRate) || inputSampleRate
       if (nextRate !== inputSampleRate) {
         print(`${style('[音频配置错误]', 'red')} Gateway 要求 ${nextRate} Hz，`
@@ -1486,24 +1525,21 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
         close()
         return
       }
-      if (ownsVoice) startMicrophone()
+      if (gatewayClientState.ownership.state === 'active') startMicrophone()
     }
     if (
       event.type === GatewayServerEvent.VOICE_CONNECTION
       && event.state === 'unavailable'
     ) {
-      frontendReady = false
       setCaptureEnabled(false)
       print(`${style('[语音前台连接失败]', 'red')} ${event.message || '请检查前台服务配置'}`)
     }
     if (event.type === GatewayServerEvent.VOICE_OWNERSHIP) {
       if (event.state === 'active') {
-        ownsVoice = true
         everOwnedVoice = true
         startMicrophone()
       } else if (event.state === 'busy') {
         if (dictationClient?.active) dictationClient.stop('dictation.cancel')
-        ownsVoice = false
         setCaptureEnabled(false)
         playback.clear()
         const holder = frontendLabel(event.holder)
@@ -1521,7 +1557,6 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     }
     if (event.type === GatewayServerEvent.VOICE_DEACTIVATED) {
       if (dictationClient?.active) dictationClient.stop('dictation.cancel')
-      ownsVoice = false
       muted = true
       setCaptureEnabled(false)
       playback.clear()
@@ -1546,10 +1581,6 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
       playback.done(event.responseId)
     }
     transcriptDisplay.handle(event)
-    if (event.type === 'timeline.inline') {
-      const content = event.item?.content || event.item?.markdown || ''
-      if (content) print(`${style('── 执行结果 ──', 'cyan')}\n${content}`)
-    }
     if (event.type === 'task.running') {
       turnStatusDisplay.status(
         event,
@@ -1640,6 +1671,9 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     nextSocket.on('open', () => {
       if (socket !== nextSocket || closed) return
       reconnectDelay = 500
+      gatewayClientState = reduceGatewayClientState(gatewayClientState, {
+        type: GatewayServerEvent.GATEWAY_CONNECTED,
+      })
       setStatus('Gateway 已连接 · 语音服务准备中')
       nextSocket.send(JSON.stringify(connectMessage({
         voiceEnabled: true,
@@ -1670,8 +1704,9 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     nextSocket.on('close', () => {
       if (socket !== nextSocket) return
       socket = null
-      frontendReady = false
-      ownsVoice = false
+      gatewayClientState = reduceGatewayClientState(gatewayClientState, {
+        type: GatewayServerEvent.GATEWAY_DISCONNECTED,
+      })
       setCaptureEnabled(false)
       playback.clear()
       transcriptDisplay.reset()

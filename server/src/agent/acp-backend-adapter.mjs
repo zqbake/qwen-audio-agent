@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { AgentError } from './backend-adapter.mjs'
-import { BACKEND_AGENT_INSTRUCTIONS } from './backend-agent-instructions.mjs'
+import {
+  COORDINATOR_MCP_INSTRUCTIONS_MAX_BYTES,
+  COORDINATOR_STABLE_INSTRUCTIONS,
+} from './acp-coordinator-instructions.mjs'
+import { BackendEventType, backendEvent } from '../core/backend-events.mjs'
 import {
   acpBackendProfile,
   endpointAvailable,
@@ -8,9 +12,8 @@ import {
 import {
   activityFromUpdate,
   coordinatorKey,
-  coordinatorPresentation,
+  messageFromUpdate,
   nativeToolOutput,
-  normalizeCoordinatorContent,
   projectSessionKey,
   sessionSummary,
 } from './acp-backend-session-utils.mjs'
@@ -26,22 +29,50 @@ import { KeyedSerialExecutor } from './keyed-serial-executor.mjs'
 import { PermissionBroker } from './permission-broker.mjs'
 import {
   appendPromptBlocks,
+  artifactsFromAcpContentBlocks,
   nonTextPromptBlocks,
+  promptWithInputParts,
   transformPromptText,
 } from './acp-content.mjs'
 import { assertMcpServerCapabilities } from './acp-capabilities.mjs'
+import { buildAcpCoordinatorInstruction } from './acp-coordinator-contract.mjs'
 
 const MAX_SESSION_RESULTS = 100
 const MAX_DELEGATION_RESULT_CHARS = 12_000
 const MAX_DELEGATION_RECENT_UPDATES = 5
 // Persistent coordinator Sessions are valid only for the contract that
 // created them. Project Sessions are user work and remain independent.
-const COORDINATOR_CONTRACT_VERSION = 2
+const COORDINATOR_CONTRACT_VERSION = 6
 
 export { acpBackendProfile } from './acp-backend-profile.mjs'
 
 function clean(value) {
   return String(value || '').trim()
+}
+
+function assertCompletedAcpTurn(result, {
+  signal,
+  label = 'ACP Session',
+  protocol = 'acp',
+} = {}) {
+  const stopReason = clean(result?.response?.stopReason)
+  if (stopReason === 'end_turn') return result
+  if (stopReason === 'cancelled') {
+    throw signal?.reason || new AgentError(`${label} 已取消`, {
+      status: 499,
+      protocol,
+    })
+  }
+  const reason = {
+    max_tokens: '达到最大输出长度，未能完成当前回合',
+    max_turn_requests: '达到最大 Agent 请求次数，未能完成当前回合',
+    refusal: '拒绝继续当前回合',
+  }[stopReason] || `返回了未知的终止原因 ${stopReason || '(missing)'}`
+  throw new AgentError(`${label} ${reason}`, {
+    status: 502,
+    protocol,
+    body: clean(result?.content),
+  })
 }
 
 function explicitModel(value) {
@@ -214,6 +245,8 @@ export class AcpBackendAdapter {
     // Track every request that reaches the persistent coordinator Session,
     // whether it stays there or delegates to a project Session.
     this.coordinationRuns = new Map()
+    this.workControllers = new Map()
+    this.workEventListeners = new Set()
     this.runtimeState = new BackendRuntimeState({
       protocol: this.protocol,
       ownership: this.ownership,
@@ -239,6 +272,19 @@ export class AcpBackendAdapter {
 
   get label() {
     return this.profile.label
+  }
+
+  coordinatorUsesMcpInstructions() {
+    return this.profile.coordinatorMcpInstructions === true
+      && Buffer.byteLength(this.stableCoordinatorInstructions(), 'utf8')
+        <= COORDINATOR_MCP_INSTRUCTIONS_MAX_BYTES
+  }
+
+  stableCoordinatorInstructions() {
+    return [
+      COORDINATOR_STABLE_INSTRUCTIONS,
+      clean(this.profile.sessionInstructions),
+    ].filter(Boolean).join('\n\n')
   }
 
   get lastHealthFailure() {
@@ -273,12 +319,34 @@ export class AcpBackendAdapter {
       sessionModel: 'one-persistent-backend-agent',
       capabilities: {
         ...this.profile.capabilities,
+        taskUpdates: 'activity',
       },
     }
   }
 
-  status() {
+  runtimeStatus() {
     return this.runtimeState.status({ clientReady: this.client.ready })
+  }
+
+  status(taskId, { ownerId } = {}) {
+    const id = clean(taskId)
+    if (!id) return this.runtimeStatus()
+    const run = this.coordinationRuns.get(id)
+    if (!run || (ownerId !== undefined && run.ownerId !== clean(ownerId))) {
+      return { taskId: id, state: 'not_found', activity: [] }
+    }
+    const delegation = run.delegation
+    if (!delegation) {
+      return { taskId: id, state: 'working', activity: [] }
+    }
+    const current = this.statusForDelegation({ delegation_id: delegation.id })
+    return {
+      taskId: id,
+      state: current.status === 'running' ? 'working' : current.status,
+      activity: current.recent_updates || [],
+      ...(current.result ? { result: current.result } : {}),
+      ...(current.error ? { error: current.error } : {}),
+    }
   }
 
   markRuntimeReady(initialized) {
@@ -289,11 +357,34 @@ export class AcpBackendAdapter {
     this.runtimeState.failed(error)
   }
 
+  async start({ signal } = {}) {
+    // Injected ACP clients used by embedders may already be ready and expose
+    // only Session operations. The adapter itself still satisfies BackendPort.
+    if (typeof this.client.start !== 'function') return this.runtimeStatus()
+    try {
+      await this.waitForBackendReadiness(signal)
+      this.runtimeState.starting()
+      const initialized = await this.client.start()
+      if (this.profile.externalMcp) {
+        assertMcpServerCapabilities({
+          label: this.label,
+          capabilities: initialized?.agentCapabilities,
+          mcpServers: [{ type: 'http' }],
+        })
+      }
+      this.markRuntimeReady(initialized)
+      return this.runtimeStatus()
+    } catch (error) {
+      if (!signal?.aborted) this.markRuntimeFailure(error)
+      throw error
+    }
+  }
+
   async health() {
     if (
       this.runtimeState.shouldBackoff()
     ) {
-      return this.status()
+      return this.runtimeStatus()
     }
     try {
       if (
@@ -303,7 +394,7 @@ export class AcpBackendAdapter {
         && !await this.backendAvailable(this.baseUrl)
       ) {
         this.runtimeState.waiting(this.profile.readinessMessage)
-        return this.status()
+        return this.runtimeStatus()
       }
       this.runtimeState.starting()
       const initialized = await this.client.start()
@@ -315,10 +406,10 @@ export class AcpBackendAdapter {
         })
       }
       this.markRuntimeReady(initialized)
-      return this.status()
+      return this.runtimeStatus()
     } catch (error) {
       this.markRuntimeFailure(error)
-      return this.status()
+      return this.runtimeStatus()
     }
   }
 
@@ -351,6 +442,34 @@ export class AcpBackendAdapter {
 
   serialize(key, operation) {
     return this.sessionExecutor.run(key, operation)
+  }
+
+  publishWorkEvent(event, { taskId, ownerId, onEvent } = {}) {
+    try {
+      onEvent?.(event)
+    } catch {
+      // A per-submission observer must not break backend execution.
+    }
+    const published = {
+      ...event,
+      taskId: clean(taskId) || null,
+      ownerId: clean(ownerId) || null,
+    }
+    for (const listener of this.workEventListeners) {
+      try {
+        listener(published)
+      } catch {
+        // Subscribers are isolated from the adapter and from each other.
+      }
+    }
+  }
+
+  subscribe(listener) {
+    if (typeof listener !== 'function') {
+      throw new TypeError('BackendPort subscriber must be a function')
+    }
+    this.workEventListeners.add(listener)
+    return () => this.workEventListeners.delete(listener)
   }
 
   async ensureCoordinatorSession(ownerId, mcpServers = []) {
@@ -431,7 +550,11 @@ export class AcpBackendAdapter {
       registration.update(context)
       return registration
     }
-    const pending = this.sessionToolServer.register(context).then(
+    const pending = this.sessionToolServer.register(context, {
+      instructions: this.coordinatorUsesMcpInstructions()
+        ? this.stableCoordinatorInstructions()
+        : '',
+    }).then(
       registration => {
         this.coordinatorToolRegistrations.set(key, registration)
         return registration
@@ -662,7 +785,7 @@ export class AcpBackendAdapter {
     return this.permissionBroker.cancel(record)
   }
 
-  async respondPermission(id, decision, { ownerId } = {}) {
+  async resolveAuthorization(id, decision, { ownerId } = {}) {
     return this.permissionBroker.respond(id, decision, { ownerId })
   }
 
@@ -671,7 +794,11 @@ export class AcpBackendAdapter {
   }
 
   rememberDelegationUpdate(record, activity) {
-    if (!record || !activity || !['plan', 'tool'].includes(activity.kind)) {
+    if (
+      !record
+      || !activity
+      || !['plan', 'tool', 'thinking', 'mode', 'session'].includes(activity.kind)
+    ) {
       return
     }
     const key = clean(activity.id)
@@ -694,8 +821,16 @@ export class AcpBackendAdapter {
   onSessionUpdate(run, update, { delegation = null } = {}) {
     run.receivedUpdate = true
     run.toolCalls ||= new Map()
+    run.messageStreams ||= {}
+    const streamedMessage = messageFromUpdate(update, run.messageStreams)
+    if (streamedMessage?.message) {
+      run.onEvent?.(backendEvent(BackendEventType.MESSAGE, {
+        ...streamedMessage,
+        streaming: true,
+      }))
+    }
     const activity = activityFromUpdate(update, run.toolCalls)
-    if (activity) run.onEvent?.({ type: 'backend.activity', activity })
+    if (activity) run.onEvent?.(backendEvent(BackendEventType.ACTIVITY, { activity }))
     if (delegation && this.profile.externalMcp) {
       this.rememberDelegationUpdate(delegation, activity)
     }
@@ -799,8 +934,7 @@ export class AcpBackendAdapter {
       directory,
       title: bounded(title || prompt, 160) || `${this.label} 项目任务`,
       ownerId: run.ownerId,
-      workId: run.coordinationRunId,
-      jobId: run.coordinationRequestId,
+      taskId: run.coordinationRunId,
       status: 'running',
       controller,
       recentUpdates: [],
@@ -815,7 +949,7 @@ export class AcpBackendAdapter {
         session.coordinationRunId = run.coordinationRunId
         session.onEvent = run.onEvent
         session.permissionScopeId = permissionScopeId
-        const result = await this.client.prompt(
+        const result = assertCompletedAcpTurn(await this.client.prompt(
           record.sessionId,
           appendPromptBlocks(prompt, run.inputBlocks),
           {
@@ -825,7 +959,11 @@ export class AcpBackendAdapter {
               delegation: record,
             }),
           },
-        )
+        ), {
+          signal: controller.signal,
+          label: `${this.label} 项目 Session`,
+          protocol: this.protocol,
+        })
         record.status = 'completed'
         record.result = result
         return {
@@ -834,6 +972,7 @@ export class AcpBackendAdapter {
           directory: record.directory,
           title: record.title,
           content: result.content,
+          contentBlocks: result.contentBlocks || [],
         }
       } catch (error) {
         record.status = controller.signal.aborted ? 'cancelled' : 'failed'
@@ -990,12 +1129,13 @@ export class AcpBackendAdapter {
   }
 
   coordinatorInstructions(message) {
+    if (this.coordinatorUsesMcpInstructions()) return message
     const sessionInstructions = clean(this.profile.sessionInstructions)
+    if (!sessionInstructions) return message
     return transformPromptText(message, content => [
-      '<qwen_audio_agent_backend_instructions>',
-      BACKEND_AGENT_INSTRUCTIONS,
-      ...(sessionInstructions ? [sessionInstructions] : []),
-      '</qwen_audio_agent_backend_instructions>',
+      '<qwen_audio_agent_backend_profile>',
+      sessionInstructions,
+      '</qwen_audio_agent_backend_profile>',
       '',
       content,
     ].join('\n'))
@@ -1008,15 +1148,22 @@ export class AcpBackendAdapter {
     let attempt = 0
     while (true) {
       try {
-        return await this.client.prompt(
+        return assertCompletedAcpTurn(await this.client.prompt(
           session.sessionId,
           this.coordinatorInstructions(prompt),
           {
             signal,
-            timeoutMs: this.timeoutMs,
+            // Agent turns are user-cancellable and may legitimately run for
+            // hours. Connection setup and control RPCs remain bounded, but a
+            // live coding turn has no artificial wall-clock deadline.
+            timeoutMs: 0,
             onUpdate,
           },
-        )
+        ), {
+          signal,
+          label: `${this.label} 协调 Session`,
+          protocol: this.protocol,
+        })
       } catch (error) {
         const retryIsSafe = !run.receivedUpdate
           && !run.delegation
@@ -1059,10 +1206,7 @@ export class AcpBackendAdapter {
     const pendingFacts = this.registry.reconciliationsFor(key)
     const prompt = pendingFacts.length
       ? transformPromptText(message, content => [
-          '<qwen_audio_agent_reconciliation>',
-          ...pendingFacts.map(fact => JSON.stringify(fact)),
-          '</qwen_audio_agent_reconciliation>',
-          '以上请求已经终止，不再是可执行输入。下方 current request 是本轮唯一需要处理的请求。',
+          '上一请求已取消，不要续接其未完成内容。仅处理以下新请求。',
           '',
           content,
         ].join('\n'))
@@ -1100,7 +1244,10 @@ export class AcpBackendAdapter {
         signal,
         onUpdate: update => this.onSessionUpdate(run, update),
       })
-      if (!clean(result?.content)) {
+      if (
+        !clean(result?.content)
+        && !(result?.contentBlocks || []).some(block => block?.type !== 'text')
+      ) {
         const error = new AgentError(
           `${this.profile.label} ACP Session 未返回任何内容`,
           { status: 502, protocol: this.protocol },
@@ -1123,10 +1270,7 @@ export class AcpBackendAdapter {
       return {
         run,
         session,
-        result: {
-          ...result,
-          content: normalizeCoordinatorContent(result.content),
-        },
+        result,
       }
     } finally {
       this.activeCoordinatorTurns.delete(session.sessionId)
@@ -1150,8 +1294,7 @@ export class AcpBackendAdapter {
       directory,
       title,
       ownerId: run.ownerId,
-      workId: run.coordinationRunId,
-      jobId: run.coordinationRequestId,
+      taskId: run.coordinationRunId,
       status: 'running',
       controller,
       result: null,
@@ -1175,13 +1318,17 @@ export class AcpBackendAdapter {
         : { content: await record.nativeCompletion.promise }
       const content = clean(completed?.content)
       record.status = 'completed'
-      record.result = { content }
+      record.result = {
+        content,
+        contentBlocks: completed?.contentBlocks || [],
+      }
       return {
         id: record.id,
         sessionId: record.sessionId,
         directory: record.directory,
         title: record.title,
         content,
+        contentBlocks: completed?.contentBlocks || [],
       }
     } catch (error) {
       record.status = record.controller.signal.aborted ? 'cancelled' : 'failed'
@@ -1190,27 +1337,30 @@ export class AcpBackendAdapter {
     }
   }
 
-  delegationResultPrompt(result, coordinationRunId) {
-    return [
-      '<qwen_audio_agent_delegation_result>',
-      JSON.stringify({
-        request_id: clean(coordinationRunId),
-        delegation_id: result.id,
-        target_session_id: result.sessionId,
-        directory: result.directory,
-        result: clean(result.content).slice(0, MAX_DELEGATION_RESULT_CHARS),
-      }, null, 2),
-      '</qwen_audio_agent_delegation_result>',
-      '这是由 Gateway 验证并关联到当前请求的第三层 Session 最终结果。',
-      '请只整理该可信结果并生成 presentation。',
-      '返回当前 request_id 的 completed 最终 presentation；',
-      '不要再次执行、委托或查询目标任务。',
+  delegationResultPrompt(result, objective = '') {
+    const task = clean(objective || result.title).slice(0, 2_000)
+    const instruction = [
+      '刚才交给独立任务处理的工作已经完成。以下是与当前请求关联的可信最终结果：',
+      ...(task ? ['', `原任务：${task}`] : []),
+      '',
+      clean(result.content).slice(0, MAX_DELEGATION_RESULT_CHARS),
+      '',
+      '请只整理以上可信结果，直接给出自然的最终答复；',
+      '不要输出任务状态或展示协议，也不要再次执行、委托或查询目标任务。',
     ].join('\n')
+    const nonTextBlocks = (result.contentBlocks || [])
+      .filter(block => block?.type !== 'text')
+    return appendPromptBlocks(instruction, nonTextBlocks)
   }
 
-  resultEnvelope(initial, delegation = null) {
+  resultEnvelope(initial, delegation = null, priorContentBlocks = []) {
     return {
       content: initial.result.content,
+      contentBlocks: [
+        ...(priorContentBlocks || []),
+        ...(delegation?.contentBlocks || []),
+        ...(initial.result.contentBlocks || []),
+      ],
       raw: initial.result.response,
       protocol: this.protocol,
       metadata: {
@@ -1253,29 +1403,79 @@ export class AcpBackendAdapter {
     }
   }
 
+  async submit(work, { signal, onEvent } = {}) {
+    const taskId = clean(work?.id)
+    const ownerId = clean(work?.ownerId)
+    const objective = clean(work?.objective ?? work?.message)
+    if (!taskId || !ownerId || !objective) {
+      throw new AgentError('BackendPort submit requires task id, owner and input', {
+        status: 400,
+        protocol: this.protocol,
+      })
+    }
+    if (this.workControllers.has(taskId)) {
+      throw new AgentError('BackendPort Task is already active', {
+        status: 409,
+        protocol: this.protocol,
+      })
+    }
+    const controller = new AbortController()
+    const workSignal = signal
+      ? AbortSignal.any([signal, controller.signal])
+      : controller.signal
+    this.workControllers.set(taskId, controller)
+    try {
+      const prompt = buildAcpCoordinatorInstruction({
+        ...work,
+        objective,
+        includeStableInstructions: !this.coordinatorUsesMcpInstructions(),
+      })
+      const run = message => this.runCoordinator(message, {
+        ownerId,
+        coordinationRunId: taskId,
+        coordinationRequestId: taskId,
+        workObjective: objective,
+        signal: workSignal,
+        onEvent,
+      })
+      const result = await run(promptWithInputParts(prompt, work?.inputParts))
+      const artifacts = artifactsFromAcpContentBlocks(result?.contentBlocks)
+      if (!clean(result?.content) && !artifacts.length) {
+        throw new AgentError('Coordinator backend returned an empty response', {
+          status: 502,
+          protocol: this.protocol,
+        })
+      }
+      return {
+        content: clean(result?.content),
+        artifacts,
+      }
+    } finally {
+      if (this.workControllers.get(taskId) === controller) {
+        this.workControllers.delete(taskId)
+      }
+    }
+  }
+
   async runCoordinator(message, {
     ownerId,
     coordinationRunId,
     coordinationRequestId,
+    workObjective,
     signal,
     onEvent,
   } = {}) {
-    if (typeof this.client.start === 'function') {
-      try {
-        // Health polling and task dispatch share the ACP client's start
-        // promise. The execution path additionally waits for an owned service
-        // endpoint, so the first task after a cold start cannot race its bridge.
-        await this.waitForBackendReadiness(signal)
-        this.runtimeState.starting()
-        this.markRuntimeReady(await this.client.start())
-      } catch (error) {
-        if (signal?.aborted) throw error
-        this.markRuntimeFailure(error)
-        throw error
-      }
-    }
+    // Health polling and task dispatch share the ACP client's start promise.
+    // The execution path additionally waits for an owned service endpoint, so
+    // the first task after a cold start cannot race its bridge.
+    await this.start({ signal })
     const runId = clean(coordinationRunId)
     const key = coordinatorKey(ownerId, this.protocol)
+    const publish = event => this.publishWorkEvent(event, {
+      taskId: runId,
+      ownerId,
+      onEvent,
+    })
     try {
       const initial = await this.serialize(
         `coordinator:${key}`,
@@ -1284,24 +1484,23 @@ export class AcpBackendAdapter {
           coordinationRunId,
           coordinationRequestId,
           signal,
-          onEvent,
+          onEvent: publish,
         }),
       )
       if (!initial.run.delegation) return this.resultEnvelope(initial)
       const delegation = initial.run.delegation
-      onEvent?.({
-        type: 'backend.delegated',
+      publish({
+        type: BackendEventType.DELEGATED,
         delegation: {
           id: delegation.id,
           sessionId: delegation.sessionId,
           title: delegation.title,
           directory: delegation.directory,
-          presentation: coordinatorPresentation(initial.result.content),
         },
       })
       const target = await delegation.promise
-      onEvent?.({
-        type: 'backend.delegation.completed',
+      publish({
+        type: BackendEventType.DELEGATION_COMPLETED,
         delegation: {
           id: target.id,
           sessionId: target.sessionId,
@@ -1312,20 +1511,21 @@ export class AcpBackendAdapter {
       const final = await this.serialize(
         `coordinator:${key}`,
         () => this.coordinatorTurnWithRecovery(
-          this.delegationResultPrompt(
-            target,
-            clean(coordinationRequestId) || clean(coordinationRunId),
-          ),
+          this.delegationResultPrompt(target, workObjective),
           {
             ownerId,
             coordinationRunId,
             coordinationRequestId,
             signal,
-            onEvent,
+            onEvent: publish,
           },
         ),
       )
-      return this.resultEnvelope(final, target)
+      return this.resultEnvelope(
+        final,
+        target,
+        initial.result.contentBlocks || [],
+      )
     } finally {
       if (runId) this.coordinationRuns.delete(runId)
     }
@@ -1350,13 +1550,18 @@ export class AcpBackendAdapter {
     }
     const ownerId = clean(task.ownerId)
     const coordinationRunId = clean(task.id)
+    const publish = event => this.publishWorkEvent(event, {
+      taskId: coordinationRunId,
+      ownerId,
+      onEvent,
+    })
     const key = coordinatorKey(ownerId, this.protocol)
     const session = await this.ensureCoordinatorSession(ownerId)
     const run = {
       ownerId,
       coordinationRunId,
-      coordinationRequestId: clean(task.jobId) || coordinationRunId,
-      onEvent,
+      coordinationRequestId: coordinationRunId,
+      onEvent: publish,
       sessionId: session.sessionId,
       nativeToolCalls: new Map(),
       toolCalls: new Map(),
@@ -1378,20 +1583,19 @@ export class AcpBackendAdapter {
         signal.reason || new Error('用户已取消这项项目任务'),
       )
     }, { once: true })
-    onEvent?.({
-      type: 'backend.delegated',
+    publish({
+      type: BackendEventType.DELEGATED,
       delegation: {
         id: delegation.id,
         sessionId: delegation.sessionId,
         title: delegation.title,
         directory: delegation.directory,
-        presentation: saved.presentation || null,
       },
     })
     try {
       const target = await delegation.promise
-      onEvent?.({
-        type: 'backend.delegation.completed',
+      publish({
+        type: BackendEventType.DELEGATION_COMPLETED,
         delegation: {
           id: target.id,
           sessionId: target.sessionId,
@@ -1402,16 +1606,13 @@ export class AcpBackendAdapter {
       const final = await this.serialize(
         `coordinator:${key}`,
         () => this.coordinatorTurn(
-          this.delegationResultPrompt(
-            target,
-            clean(task.jobId) || coordinationRunId,
-          ),
+          this.delegationResultPrompt(target, task.objective),
           {
             ownerId,
             coordinationRunId,
-            coordinationRequestId: clean(task.jobId) || coordinationRunId,
+            coordinationRequestId: coordinationRunId,
             signal,
-            onEvent,
+            onEvent: publish,
           },
         ),
       )
@@ -1421,8 +1622,8 @@ export class AcpBackendAdapter {
     }
   }
 
-  async cancelWork(workId, { ownerId } = {}) {
-    const run = this.coordinationRuns.get(clean(workId))
+  async cancelWork(taskId, { ownerId } = {}) {
+    const run = this.coordinationRuns.get(clean(taskId))
     const record = run?.delegation
     if (run && run.ownerId !== clean(ownerId)) {
       throw new AgentError(`没有找到可取消的 ${this.label} 任务`, {
@@ -1440,7 +1641,7 @@ export class AcpBackendAdapter {
         coordinatorKey(ownerId, this.protocol),
         {
           kind: 'coordination_request_terminated',
-          request_id: run.coordinationRequestId || clean(workId),
+          request_id: run.coordinationRequestId || clean(taskId),
           outcome: 'cancelled',
           ...(record
             ? {
@@ -1464,8 +1665,38 @@ export class AcpBackendAdapter {
     }
   }
 
-  async queryDelegatedWork(workId, _question, { ownerId } = {}) {
-    const run = this.coordinationRuns.get(clean(workId))
+  async cancel(taskId, options = {}) {
+    const id = clean(taskId)
+    const controller = this.workControllers.get(id)
+    if (!controller && !this.coordinationRuns.has(id)) {
+      return { taskId: id, state: 'not_found' }
+    }
+    await this.cancelWork(id, options)
+    controller?.abort(new AgentError('用户已取消这项工作', {
+      status: 499,
+      protocol: this.protocol,
+    }))
+    return { taskId: id, state: 'cancelled' }
+  }
+
+  async respondAuthorization(
+    taskId,
+    authorizationId,
+    decision,
+    { ownerId } = {},
+  ) {
+    const pending = this.pendingPermissions.get(clean(authorizationId))
+    if (pending && clean(taskId) && pending.taskId !== clean(taskId)) {
+      throw new AgentError('权限请求不属于这项工作', {
+        status: 404,
+        protocol: this.protocol,
+      })
+    }
+    return this.resolveAuthorization(authorizationId, decision, { ownerId })
+  }
+
+  async queryDelegatedWork(taskId, _question, { ownerId } = {}) {
+    const run = this.coordinationRuns.get(clean(taskId))
     const record = run?.delegation
     if (!record || record.ownerId !== clean(ownerId)) {
       throw new AgentError(`没有找到对应的 ${this.label} 项目任务`, {
@@ -1478,7 +1709,7 @@ export class AcpBackendAdapter {
       latest?.detail || latest?.tool || latest?.kind,
       240,
     )
-    const speech = status.status === 'completed'
+    const answer = status.status === 'completed'
       ? `这项工作已经完成：${clean(status.result)}`
       : status.status === 'failed'
         ? `这项工作已经失败：${clean(status.error)}`
@@ -1489,10 +1720,10 @@ export class AcpBackendAdapter {
             : '这项工作仍在执行中，当前没有新的详细进展。'
     return {
       content: JSON.stringify({
-        job_id: clean(record.jobId) || clean(workId),
+        task_id: clean(record.taskId) || clean(taskId),
         state: 'completed',
         mode: 'respond',
-        presentation: { speech, inline: null },
+        result: answer,
       }),
       protocol: this.protocol,
       metadata: {
@@ -1520,6 +1751,13 @@ export class AcpBackendAdapter {
   }
 
   async close() {
+    for (const controller of this.workControllers.values()) {
+      controller.abort(new AgentError('后台 Agent 已关闭', {
+        status: 503,
+        protocol: this.protocol,
+      }))
+    }
+    this.workControllers.clear()
     for (const run of this.coordinationRuns.values()) {
       run.delegation?.controller.abort(
         new Error(`${this.label} backend is shutting down`),
@@ -1539,6 +1777,7 @@ export class AcpBackendAdapter {
       this.client.close(),
     ])
     await this.builtinMcpLifecycle.close()
+    this.workEventListeners.clear()
     this.runtimeState.stopped()
   }
 }

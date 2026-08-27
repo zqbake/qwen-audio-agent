@@ -1,32 +1,45 @@
 import { randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { config } from '../core/config.mjs'
 import { TaskScheduler } from './task-scheduler.mjs'
 import { TaskStore } from './task-store.mjs'
+import { TaskDomainEvent } from './task-events.mjs'
+import { TaskNotificationQueue } from './task-notification-queue.mjs'
+import { TaskRepository } from './task-repository.mjs'
+import {
+  artifactsFromOutcome,
+  mergeArtifacts,
+  normalizeArtifacts,
+} from './task-artifact.mjs'
+import {
+  normalizeAuthorization,
+  resolveAuthorization,
+} from '../core/work-authorization.mjs'
+import {
+  isTaskActive,
+  isTaskCancellable,
+  isTaskTerminal,
+  isUserWork,
+  normalizeTaskScope,
+  persistedTask,
+  publicTask,
+  TaskScope,
+  TaskStatus,
+  transitionTask,
+} from './task-state.mjs'
+import {
+  recoveredNotificationStatus,
+  TaskRecoveryAction,
+  taskRecoveryAction,
+} from './task-recovery.mjs'
 import { logger } from '../core/logger.mjs'
-
-const ACTIVE = new Set([
-  'queued',
-  'running',
-  'delegated',
-  'finalizing',
-  'cancelling',
-])
-const CANCELLABLE = new Set(['scheduled', 'queued', 'running', 'delegated', 'finalizing'])
-const TERMINAL = new Set(['completed', 'failed', 'cancelled'])
-const REPLAYABLE_REMINDER = new Set(['queued', 'running'])
-const MAX_JOB_NUMBER = 99_999
-
-function normalizedJobNumber(value) {
-  const number = Number(value)
-  return Number.isInteger(number) && number >= 1 && number <= MAX_JOB_NUMBER
-    ? number
-    : 1
-}
+import { BackendEventType } from '../core/backend-events.mjs'
+import { SessionJournalRegistry } from '../session/session-journal-registry.mjs'
 
 export function taskExecutionContext(task, { onEvent, signal }) {
   return Object.freeze({
     taskId: String(task.id),
-    jobId: String(task.jobId || ''),
     ownerId: String(task.ownerId || ''),
     sessionId: String(task.sessionId || 'main'),
     turnId: task.turnId || null,
@@ -37,108 +50,68 @@ export function taskExecutionContext(task, { onEvent, signal }) {
   })
 }
 
-function publicResultMetadata(metadata) {
-  if (!metadata || typeof metadata !== 'object') return null
-  const source = metadata.presentation || metadata.decision?.presentation
-  if (!source || typeof source !== 'object') return null
-  const inline = source.inline && typeof source.inline === 'object'
-    && typeof source.inline.content === 'string'
-    && source.inline.content.trim()
-    ? {
-        title: typeof source.inline.title === 'string'
-          ? source.inline.title.slice(0, 120)
-          : '',
-        format: ['markdown', 'code', 'link'].includes(source.inline.format)
-          ? source.inline.format
-          : 'markdown',
-        content: source.inline.content,
-      }
-    : null
-  const speech = typeof source.speech === 'string' ? source.speech : ''
-  if (!speech && !inline) return null
-  return { presentation: { speech, inline } }
-}
-
-function publicTask(task) {
-  const now = Date.now()
-  return {
-    id: task.id,
-    workId: task.id,
-    jobId: task.jobId,
-    workState: ACTIVE.has(task.status) ? 'active' : task.status,
-    status: task.status,
-    kind: task.kind || 'work',
-    parentWorkId: task.parentWorkId || null,
-    objective: task.objective,
-    ownerId: task.ownerId,
-    sessionId: task.sessionId,
-    turnId: task.turnId,
-    createdAt: task.createdAt,
-    startedAt: task.startedAt,
-    completedAt: task.completedAt,
-    elapsedMs: task.startedAt && ACTIVE.has(task.status)
-      ? now - task.startedAt
-      : task.elapsedMs,
-    result: task.result,
-    error: task.error,
-    resultMetadata: publicResultMetadata(task.resultMetadata),
-    activity: [...(task.activity || [])],
-    delegation: task.delegation
-      ? {
-          status: task.delegation.status || 'running',
-          title: String(task.delegation.title || '').slice(0, 160),
-          presentation: task.delegation.presentation
-            ? {
-                speech: String(
-                  task.delegation.presentation.speech || '',
-                ).slice(0, 1200),
-                inline: task.delegation.presentation.inline || null,
-              }
-            : null,
-        }
-      : null,
-    authorization: task.authorization
-      ? { ...task.authorization }
-      : null,
-    notificationStatus: task.notificationStatus,
-    notificationDeliveredAt: task.notificationDeliveredAt,
-    schedule: task.schedule || null,
-    timeoutMs: task.timeoutMs || null,
-    progressCheckMs: task.progressCheckMs || null,
-  }
-}
-
 export class TaskManager {
   constructor({
     runner = null,
     store = null,
     maxConcurrent = 4,
     maxConcurrentPerOwner = 2,
+    systemMaxConcurrent = 2,
     terminalTtlMs = 86_400_000,
     pendingNotificationTtlMs = 604_800_000,
     notificationClaimTtlMs = 60_000,
     maxTerminalTasksPerOwner = 100,
-    progressCheckMs = config.backgroundTaskProgressCheckMs,
+    progressEventIntervalMs = 1_000,
     logger: taskLogger = null,
+    sessionJournal = null,
   } = {}) {
     this.runner = runner
-    this.store = store
+    this.repository = new TaskRepository({ store, serialize: persistedTask })
+    // Compatibility view for ReminderScheduler and existing integrations.
+    // New persistence behavior belongs to repository, not this Map-like view.
+    this.tasks = this.repository
     this.scheduler = new TaskScheduler({
       maxConcurrent,
       maxConcurrentPerOwner,
+    })
+    this.systemScheduler = new TaskScheduler({
+      maxConcurrent: systemMaxConcurrent,
+      maxConcurrentPerOwner: systemMaxConcurrent,
     })
     this.terminalTtlMs = terminalTtlMs
     this.pendingNotificationTtlMs = pendingNotificationTtlMs
     this.notificationClaimTtlMs = notificationClaimTtlMs
     this.maxTerminalTasksPerOwner = maxTerminalTasksPerOwner
-    this.progressCheckMs = Math.max(0, Number(progressCheckMs) || 0)
+    this.progressEventIntervalMs = Math.max(
+      50,
+      Number(progressEventIntervalMs) || 1_000,
+    )
     this.logger = taskLogger
-    this.tasks = new Map()
+    this.sessionJournal = sessionJournal
     this.listeners = new Set()
+    this.notifications = new TaskNotificationQueue({
+      tasks: this.tasks,
+      snapshot: publicTask,
+      claimTtlMs: () => this.notificationClaimTtlMs,
+      onChanged: () => this.persist(),
+      onDelivered: task => this.emit(
+        TaskDomainEvent.NOTIFICATION_DELIVERED,
+        task,
+        { persist: false },
+      ),
+    })
     this.recoveryCandidates = []
     this.scheduledTaskRunner = null
-    this.nextJobNumber = 1
     this.restore()
+    if (this.sessionJournal) this.restoreFromJournal(this.sessionJournal)
+  }
+
+  get nextTaskNumber() {
+    return this.repository.nextTaskNumber
+  }
+
+  set nextTaskNumber(value) {
+    this.repository.nextTaskNumber = value
   }
 
   configureRetention(options = {}) {
@@ -150,37 +123,61 @@ export class TaskManager {
     this.scheduledTaskRunner = runner
   }
 
-  restore() {
-    const savedTasks = this.store?.load() || []
-    this.nextJobNumber = normalizedJobNumber(this.store?.nextJobNumber)
-    for (const saved of savedTasks) {
-      saved.jobId = String(saved.jobId || this.allocateJobId())
-      // Scheduled tasks survive restarts intact. ReminderScheduler.start()
-      // handles overdue vs future dispatch. Reminders that had already fired
-      // (queued/running) when the Gateway stopped are also restored as
-      // scheduled: their runner only speaks the stored text, so re-firing
-      // them as overdue catch-up is safe and they are never silently lost.
-      const restartAsScheduled = (
-        saved.kind === 'reminder'
-        && REPLAYABLE_REMINDER.has(saved.status)
-      )
-      if (saved.status === 'scheduled' || restartAsScheduled) {
+  schedulerFor(task) {
+    return isUserWork(task) ? this.scheduler : this.systemScheduler
+  }
+
+  releaseScheduler(task) {
+    if (!task.schedulerHeld) return
+    this.schedulerFor(task).release(task)
+    task.schedulerHeld = false
+  }
+
+  restore(savedTasks = null) {
+    const records = savedTasks || this.repository.load()
+    let recoveryChanged = false
+    for (const saved of records) {
+      saved.scope = normalizeTaskScope(saved.scope)
+      if (isUserWork(saved) && !/^task_\d+$/u.test(String(saved.id || ''))) {
+        const legacy = /^job_(\d+)$/u.exec(String(saved.jobId || ''))
+        const candidate = legacy ? `task_${legacy[1]}` : ''
+        saved.id = candidate && !this.tasks.get(candidate)
+          ? candidate
+          : this.allocateTaskId()
+        recoveryChanged = true
+      }
+      delete saved.jobId
+      if (!saved.parentTaskId && saved.parentWorkId) {
+        saved.parentTaskId = saved.parentWorkId
+      }
+      delete saved.parentWorkId
+      delete saved.presentation
+      delete saved.resultMetadata
+      saved.artifacts = normalizeArtifacts(saved.artifacts)
+      saved.authorization = normalizeAuthorization(saved.authorization, {
+        taskId: saved.id,
+      })
+      const recovery = taskRecoveryAction(saved)
+      if (recovery !== TaskRecoveryAction.RESTORE) recoveryChanged = true
+      if (saved.notificationStatus === 'delivering') recoveryChanged = true
+      // Scheduled work survives intact. A reminder that was already firing
+      // is safe to catch up because its runner only speaks persisted text.
+      if (recovery === TaskRecoveryAction.RESCHEDULE) {
         const task = {
           ...saved,
           status: 'scheduled',
           runner: saved.kind === 'reminder'
-            ? async (obj) => ({
-                content: obj,
-                metadata: { presentation: { speech: obj } },
-              })
+            ? async obj => ({ content: obj })
             : null, // scheduled_task runner set from scheduledTaskRunner in start()
           resolve: null,
           promise: null,
           activity: Array.isArray(saved.activity) ? saved.activity : [],
           abortController: null,
           schedulerHeld: false,
+          notificationStatus: 'none',
+          notificationClaimantId: null,
+          notificationClaimedAt: null,
           timeoutTimer: null,
-          progressCheckTimer: null,
         }
         task.promise = new Promise(resolve => {
           task.resolve = resolve
@@ -188,45 +185,42 @@ export class TaskManager {
         this.tasks.set(task.id, task)
         continue
       }
-      const wasActive = ACTIVE.has(saved.status)
-      const canRecoverDelegation = (
-        ['delegated', 'finalizing'].includes(saved.status)
-        && saved.delegation?.id
-        && saved.delegation?.sessionId
-      )
+      const reattach = recovery === TaskRecoveryAction.REATTACH
+      const fail = recovery === TaskRecoveryAction.FAIL
+      const cancel = recovery === TaskRecoveryAction.CANCEL
       const task = {
         ...saved,
-        status: canRecoverDelegation
+        status: reattach
           ? 'queued'
-          : wasActive ? 'failed' : saved.status,
-        error: wasActive && !canRecoverDelegation
+          : cancel ? 'cancelled'
+            : fail ? 'failed' : saved.status,
+        error: fail
           ? 'qwen-audio-agent 重启时这项工作尚未完成，请重新提交。'
-          : saved.error || null,
-        completedAt: wasActive && !canRecoverDelegation
+          : cancel ? null : saved.error || null,
+        completedAt: fail || cancel
           ? Date.now()
           : saved.completedAt,
         activity: Array.isArray(saved.activity) ? saved.activity : [],
-        delegation: canRecoverDelegation || !wasActive
+        delegation: reattach || !isTaskActive(saved.status)
           ? saved.delegation || null
           : null,
-        authorization: wasActive || TERMINAL.has(saved.status)
+        authorization: recovery !== TaskRecoveryAction.RESTORE
+          || isTaskTerminal(saved.status)
           ? null
-          : saved.authorization || null,
-        notificationStatus: (
-          (wasActive && !canRecoverDelegation)
-          || saved.notificationStatus === 'delivering'
-        )
-          ? 'pending'
-          : canRecoverDelegation ? 'none' : saved.notificationStatus || 'none',
+          : saved.authorization,
+        notificationStatus: recoveredNotificationStatus(saved, recovery),
         notificationClaimantId: null,
         notificationClaimedAt: null,
         resolve: null,
         promise: null,
         runner: null,
         timeoutTimer: null,
-        progressCheckTimer: null,
+        // Until the adapter accepts recovery, persistence must retain the
+        // recoverable backend phase rather than checkpoint the temporary
+        // in-memory `queued` phase.
+        recoveryPersistedStatus: reattach ? saved.status : null,
       }
-      if (canRecoverDelegation) {
+      if (reattach) {
         task.promise = new Promise(resolve => {
           task.resolve = resolve
         })
@@ -237,22 +231,34 @@ export class TaskManager {
       this.tasks.set(task.id, task)
     }
     this.prune()
+    if (recoveryChanged) this.persist()
   }
 
-  persistedTask(task) {
-    const saved = publicTask(task)
-    delete saved.workId
-    delete saved.workState
-    saved.submissionKey = task.submissionKey || null
-    saved.delegation = task.delegation
-      ? {
-          ...task.delegation,
-          presentation: task.delegation.presentation
-            ? { ...task.delegation.presentation }
-            : null,
-        }
-      : null
-    return saved
+  /** Reconciles the task projection with the latest durable Journal snapshot. */
+  restoreFromJournalSnapshots(snapshots = []) {
+    const candidates = snapshots.filter(snapshot => snapshot?.id)
+    if (!candidates.length) return 0
+    let restored = 0
+    for (const snapshot of candidates) {
+      const id = String(snapshot.id)
+      const existing = this.tasks.get(id)
+      // A journal event is the durable revision. Remove the compact snapshot
+      // projection before replaying it so a terminal Journal state can repair
+      // a stale/failed tasks.json state after a crash.
+      if (existing) {
+        this.recoveryCandidates = this.recoveryCandidates.filter(
+          candidate => candidate !== existing,
+        )
+        this.tasks.delete(id)
+      }
+      this.restore([{ ...snapshot }])
+      restored += 1
+    }
+    return restored
+  }
+
+  restoreFromJournal(journal) {
+    return this.restoreFromJournalSnapshots(journal?.taskSnapshotsSync?.() || [])
   }
 
   recoverDelegated({
@@ -267,14 +273,17 @@ export class TaskManager {
         delegation: task.delegation ? { ...task.delegation } : null,
       }
       if (!canRecover?.(snapshot)) {
-        task.status = 'failed'
+        task.recoveryPersistedStatus = null
+        transitionTask(task, TaskStatus.FAILED)
         task.error = 'qwen-audio-agent 重启时这项项目任务失去连接，请重新提交。'
         task.completedAt = Date.now()
-        task.notificationStatus = 'pending'
+        task.notificationStatus = isUserWork(task) ? 'pending' : 'none'
         task.promise = Promise.resolve(publicTask(task))
         task.resolve = null
-        this.emit('task.failed', task)
-        this.emit('task.notification.pending', task)
+        this.emit(TaskDomainEvent.FAILED, task)
+        if (isUserWork(task)) {
+          this.emit(TaskDomainEvent.NOTIFICATION_PENDING, task)
+        }
         continue
       }
       task.runner = (_objective, context) => runner(snapshot, context)
@@ -286,28 +295,21 @@ export class TaskManager {
   }
 
   persist() {
-    this.store?.save(
-      [...this.tasks.values()].map(task => this.persistedTask(task)),
-      { nextJobNumber: this.nextJobNumber },
-    )
+    this.repository.save()
   }
 
   persistDeferred() {
-    const tasks = [...this.tasks.values()].map(task => this.persistedTask(task))
-    const state = { nextJobNumber: this.nextJobNumber }
-    if (this.store?.saveDeferred) this.store.saveDeferred(tasks, state)
-    else this.store?.save(tasks, state)
+    this.repository.saveDeferred()
   }
 
-  allocateJobId() {
-    const current = this.nextJobNumber
-    this.nextJobNumber = current >= MAX_JOB_NUMBER ? 1 : current + 1
-    return `job_${current}`
+  allocateTaskId() {
+    return this.repository.allocateTaskId()
   }
 
-  subscribe(listener) {
-    this.listeners.add(listener)
-    return () => this.listeners.delete(listener)
+  subscribe(listener, { scope = TaskScope.USER } = {}) {
+    const subscription = { listener, scope }
+    this.listeners.add(subscription)
+    return () => this.listeners.delete(subscription)
   }
 
   emit(type, task, { persist = true, ...details } = {}) {
@@ -319,15 +321,15 @@ export class TaskManager {
       ...details,
     }
     const log = [
-      'task.scheduled',
+      TaskDomainEvent.SCHEDULED,
       'task.created',
-      'task.running',
-      'task.delegated',
-      'task.permission.requested',
-      'task.permission.resolved',
-      'task.completed',
-      'task.failed',
-      'task.cancelled',
+      TaskDomainEvent.RUNNING,
+      TaskDomainEvent.DELEGATED,
+      TaskDomainEvent.PERMISSION_REQUESTED,
+      TaskDomainEvent.PERMISSION_RESOLVED,
+      TaskDomainEvent.COMPLETED,
+      TaskDomainEvent.FAILED,
+      TaskDomainEvent.CANCELLED,
     ].includes(type) ? this.logger?.info : this.logger?.debug
     log?.(type, {
       taskId: task.id,
@@ -339,9 +341,13 @@ export class TaskManager {
       elapsedMs: task.elapsedMs,
       hasError: Boolean(task.error),
     })
-    for (const listener of this.listeners) {
+    for (const subscription of this.listeners) {
+      if (
+        subscription.scope !== 'all'
+        && normalizeTaskScope(task.scope) !== subscription.scope
+      ) continue
       try {
-        listener(event)
+        subscription.listener(event)
       } catch {
         // One observer must not break the work queue.
       }
@@ -349,7 +355,46 @@ export class TaskManager {
     if (persist) this.persist()
   }
 
-  create({
+  markProgressChanged(task, { message = false } = {}) {
+    task.progressChanged = true
+    if (message) task.messageChanged = true
+  }
+
+  flushProgress(task, { heartbeat = false } = {}) {
+    if (!heartbeat && !task.progressChanged) return false
+    const messageChanged = task.messageChanged === true
+    task.progressChanged = false
+    task.messageChanged = false
+    this.emit(
+      messageChanged ? TaskDomainEvent.UPDATED : TaskDomainEvent.PROGRESS,
+      task,
+      {
+        persist: false,
+        ...(messageChanged ? { message: task.message } : {}),
+      },
+    )
+    return true
+  }
+
+  create(options = {}) {
+    return this.#create({
+      ...options,
+      scope: TaskScope.USER,
+      kind: options.kind || 'work',
+    })
+  }
+
+  createSystemJob(options = {}) {
+    return this.#create({
+      ...options,
+      scope: TaskScope.SYSTEM,
+      kind: options.kind || 'system_job',
+      ownerId: options.ownerId || 'system',
+      sessionId: options.sessionId || 'system',
+    })
+  }
+
+  #create({
     objective,
     ownerId,
     sessionId,
@@ -357,27 +402,32 @@ export class TaskManager {
     submissionKey,
     laneKey,
     laneLimit = 1,
-    kind = 'work',
-    parentWorkId = null,
+    kind,
+    scope,
+    parentTaskId = null,
     priority = 0,
     runner,
     canceler,
   }) {
+    const normalizedScope = normalizeTaskScope(scope)
     const normalizedOwnerId = String(ownerId || '')
     const normalizedSubmissionKey = String(submissionKey || '').trim()
     if (normalizedSubmissionKey) {
       const existing = [...this.tasks.values()].find(item => (
         item.ownerId === normalizedOwnerId
+        && normalizeTaskScope(item.scope) === normalizedScope
         && item.submissionKey === normalizedSubmissionKey
       ))
       if (existing) return { ...publicTask(existing), reused: true }
     }
     const task = {
-      id: `work_${randomUUID()}`,
-      jobId: this.allocateJobId(),
+      id: normalizedScope === TaskScope.USER
+        ? this.allocateTaskId()
+        : `system_${randomUUID()}`,
       status: 'queued',
-      kind: String(kind || 'work'),
-      parentWorkId: parentWorkId ? String(parentWorkId) : null,
+      scope: normalizedScope,
+      kind: String(kind),
+      parentTaskId: parentTaskId ? String(parentTaskId) : null,
       priority: Number.isFinite(Number(priority)) ? Number(priority) : 0,
       objective: String(objective || '').trim(),
       ownerId: normalizedOwnerId,
@@ -392,7 +442,8 @@ export class TaskManager {
       elapsedMs: 0,
       result: null,
       error: null,
-      resultMetadata: null,
+      message: null,
+      artifacts: [],
       activity: [],
       delegation: null,
       cancellation: null,
@@ -406,15 +457,12 @@ export class TaskManager {
       terminalHandled: false,
       abortController: null,
       schedulerHeld: false,
-      progressCheckMs: String(kind || 'work') === 'work'
-        ? this.progressCheckMs
-        : null,
     }
     task.promise = new Promise(resolve => {
       task.resolve = resolve
     })
     this.tasks.set(task.id, task)
-    this.emit('task.accepted', task)
+    this.emit(TaskDomainEvent.ACCEPTED, task)
     queueMicrotask(() => this.drain())
     return { ...publicTask(task), reused: false }
   }
@@ -431,28 +479,28 @@ export class TaskManager {
   }) {
     const kind = type === 'task' ? 'scheduled_task' : 'reminder'
     const task = {
-      id: `work_${randomUUID()}`,
-      jobId: this.allocateJobId(),
+      id: this.allocateTaskId(),
       status: 'scheduled',
+      scope: TaskScope.USER,
       kind,
       objective: String(objective || '').trim(),
       ownerId: String(ownerId || ''),
       sessionId: String(sessionId || 'main'),
       turnId: turnId || null,
       priority: 0,
-      parentWorkId: null,
+      parentTaskId: null,
       schedule: { type: 'at', at: Number(at), recurrence },
       timeoutMs: type === 'task'
         ? Number(timeoutMs) || config.scheduledTaskTimeoutMs
         : null,
-      progressCheckMs: null,
       createdAt: Date.now(),
       startedAt: null,
       completedAt: null,
       elapsedMs: 0,
       result: null,
       error: null,
-      resultMetadata: null,
+      message: null,
+      artifacts: [],
       activity: [],
       delegation: null,
       cancellation: null,
@@ -460,23 +508,19 @@ export class TaskManager {
       notificationStatus: 'none',
       notificationClaimantId: null,
       notificationClaimedAt: null,
-      runner: runner || (async (obj) => ({
-        content: obj,
-        metadata: { presentation: { speech: obj } },
-      })),
+      runner: runner || (async obj => ({ content: obj })),
       canceler: null,
       cancelPromise: null,
       terminalHandled: false,
       abortController: null,
       schedulerHeld: false,
       timeoutTimer: null,
-      progressCheckTimer: null,
     }
     task.promise = new Promise(resolve => {
       task.resolve = resolve
     })
     this.tasks.set(task.id, task)
-    this.emit('task.scheduled', task)
+    this.emit(TaskDomainEvent.SCHEDULED, task)
     // Do not call drain() — scheduled tasks wait for their timer.
     return { ...publicTask(task), reused: false }
   }
@@ -489,69 +533,111 @@ export class TaskManager {
         || left.createdAt - right.createdAt
       ))
     for (const task of queued) {
-      if (!this.scheduler.canStart(task)) continue
+      if (!this.schedulerFor(task).canStart(task)) continue
       this.start(task)
     }
   }
 
   start(task) {
-    task.status = 'running'
+    task.recoveryPersistedStatus = null
+    transitionTask(task, TaskStatus.RUNNING)
     task.startedAt = Date.now()
     task.abortController = new AbortController()
-    this.scheduler.acquire(task)
+    this.schedulerFor(task).acquire(task)
     task.schedulerHeld = true
-    this.emit('task.running', task)
+    this.emit(TaskDomainEvent.RUNNING, task)
     task.progressTimer = setInterval(() => {
-      if (ACTIVE.has(task.status)) {
-        this.emit('task.progress', task, { persist: false })
+      if (isTaskActive(task.status)) {
+        this.flushProgress(task, { heartbeat: true })
       }
-    }, 1000)
+    }, this.progressEventIntervalMs)
     task.progressTimer.unref?.()
     const onEvent = event => {
-      if (event?.type === 'backend.permission.requested' && event.permission) {
-        task.authorization = { ...event.permission }
-        this.emit('task.permission.requested', task)
+      if (
+        event?.type === BackendEventType.AUTHORIZATION_REQUESTED
+        && event.permission
+      ) {
+        const authorization = normalizeAuthorization(event.permission, {
+          taskId: task.id,
+        })
+        if (!authorization) return
+        task.authorization = authorization
+        this.emit(TaskDomainEvent.PERMISSION_REQUESTED, task, {
+          permission: authorization,
+        })
         return
       }
-      if (event?.type === 'backend.permission.resolved' && event.permission) {
-        if (task.authorization?.id === event.permission.id) {
+      if (
+        event?.type === BackendEventType.AUTHORIZATION_RESOLVED
+        && event.permission
+      ) {
+        const permission = resolveAuthorization(
+          task.authorization?.id === event.permission.id
+            ? task.authorization
+            : event.permission,
+          event.permission.status,
+          { taskId: task.id },
+        )
+        if (!permission) return
+        if (task.authorization?.id === permission.id) {
           task.authorization = null
         }
-        this.emit('task.permission.resolved', task, {
-          permission: { ...event.permission },
+        this.emit(TaskDomainEvent.PERMISSION_RESOLVED, task, {
+          permission,
         })
         return
       }
       if (['cancelling', 'cancelled'].includes(task.status)) return
-      if (event?.type === 'backend.delegated' && event.delegation) {
-        task.status = 'delegated'
-        task.delegation = { ...event.delegation }
-        if (task.schedulerHeld) {
-          this.scheduler.release(task)
-          task.schedulerHeld = false
-        }
-        this.emit('task.delegated', task)
+      if (event?.type === BackendEventType.DELEGATED && event.delegation) {
+        transitionTask(task, TaskStatus.DELEGATED)
+        const { presentation: _presentation, ...delegation } = event.delegation
+        task.delegation = delegation
+        this.releaseScheduler(task)
+        this.emit(TaskDomainEvent.DELEGATED, task)
         this.drain()
         return
       }
       if (
-        event?.type === 'backend.delegation.completed'
+        event?.type === BackendEventType.DELEGATION_COMPLETED
         && event.delegation
       ) {
-        task.status = 'finalizing'
+        transitionTask(task, TaskStatus.FINALIZING)
         task.delegation = { ...event.delegation, status: 'completed' }
-        this.emit('task.finalizing', task)
+        this.emit(TaskDomainEvent.FINALIZING, task)
         return
       }
-      if (event?.type !== 'backend.activity' || !event.activity) return
+      if (event?.type === BackendEventType.MESSAGE && event.message) {
+        const message = String(event.message).trim().slice(0, 4_000)
+        if (!message || message === task.message) return
+        task.message = message
+        this.markProgressChanged(task, { message: true })
+        this.persistDeferred()
+        return
+      }
+      if (event?.type === BackendEventType.ARTIFACT && event.artifact) {
+        const artifacts = normalizeArtifacts([event.artifact])
+        if (!artifacts.length) return
+        const artifact = artifacts[0]
+        const merged = mergeArtifacts(task.artifacts, [artifact])
+        if (isDeepStrictEqual(merged, task.artifacts)) return
+        task.artifacts = merged
+        this.emit(TaskDomainEvent.UPDATED, task, { persist: false })
+        this.persistDeferred()
+        return
+      }
+      if (event?.type !== BackendEventType.ACTIVITY || !event.activity) return
       const activity = event.activity
       const index = activity.id
         ? task.activity.findIndex(item => item.id === activity.id)
         : -1
-      if (index >= 0) task.activity[index] = activity
-      else task.activity.push(activity)
+      if (
+        index === task.activity.length - 1
+        && isDeepStrictEqual(task.activity[index], activity)
+      ) return
+      if (index >= 0) task.activity.splice(index, 1)
+      task.activity.push(activity)
       task.activity = task.activity.slice(-20)
-      this.emit('task.progress', task, { persist: false })
+      this.markProgressChanged(task)
       this.persistDeferred()
     }
     // Fallback runner for restored scheduled tasks whose runner was lost
@@ -567,14 +653,14 @@ export class TaskManager {
     // cleanup window before force-failing.
     if (task.kind === 'scheduled_task' && task.timeoutMs) {
       task.timeoutTimer = setTimeout(() => {
-        if (!ACTIVE.has(task.status)) return
+        if (!isTaskActive(task.status)) return
         task.abortController?.abort(
           new Error('定时任务执行超时，正在终止'),
         )
         const cleanup = setTimeout(() => {
-          if (!ACTIVE.has(task.status)) return
+          if (!isTaskActive(task.status)) return
           task.terminalHandled = true
-          task.status = 'failed'
+          transitionTask(task, TaskStatus.FAILED)
           task.error = `定时任务执行超时（${Math.round(task.timeoutMs / 60000)} 分钟）`
           task.completedAt = Date.now()
           task.elapsedMs = task.startedAt
@@ -582,59 +668,15 @@ export class TaskManager {
           task.notificationStatus = 'pending'
           clearInterval(task.progressTimer)
           task.progressTimer = null
-          clearInterval(task.progressCheckTimer)
-          task.progressCheckTimer = null
-          if (task.schedulerHeld) {
-            this.scheduler.release(task)
-            task.schedulerHeld = false
-          }
-          this.emit('task.failed', task)
-          this.emit('task.notification.pending', task)
+          this.releaseScheduler(task)
+          this.emit(TaskDomainEvent.FAILED, task)
+          this.emit(TaskDomainEvent.NOTIFICATION_PENDING, task)
           this.persistDeferred()
           this.drain()
         }, 5000)
         cleanup.unref?.()
       }, task.timeoutMs)
       task.timeoutTimer.unref?.()
-    }
-    // Interactive background work reports long-running progress. Scheduled
-    // work stays quiet until it completes, fails, or needs permission.
-    if (task.kind === 'work' && task.progressCheckMs) {
-      task.progressCheckTimer = setInterval(() => {
-        if (!ACTIVE.has(task.status)) {
-          clearInterval(task.progressCheckTimer)
-          task.progressCheckTimer = null
-          return
-        }
-        const lastActivity = task.activity.at(-1)
-        const elapsedMin = Math.round(
-          (Date.now() - (task.startedAt || Date.now())) / 60000,
-        )
-        let message
-        if (lastActivity) {
-          const verb = {
-            run: '执行',
-            read: '读取',
-            write: '修改',
-            search: '搜索',
-            image: '生成图片',
-          }[lastActivity.category] || '处理'
-          const detail = lastActivity.detail
-            ? ` ${lastActivity.detail}` : ''
-          message = `任务"${task.objective.slice(0, 80)}"`
-            + `已运行 ${elapsedMin} 分钟，正在${verb}${detail}`
-            + `（${lastActivity.status}）`
-        } else {
-          message = `任务"${task.objective.slice(0, 80)}"`
-            + `已运行 ${elapsedMin} 分钟，正在处理中`
-        }
-        this.emit('task.progress.check', task, {
-          persist: false,
-          message,
-          delegated: task.status === 'delegated',
-        })
-      }, task.progressCheckMs)
-      task.progressCheckTimer.unref?.()
     }
     Promise.resolve()
       .then(() => {
@@ -651,16 +693,21 @@ export class TaskManager {
           task.terminalHandled
           || ['cancelling', 'cancelled'].includes(task.status)
         ) return
-        task.status = 'completed'
+        this.flushProgress(task)
+        transitionTask(task, TaskStatus.COMPLETED)
         task.result = String(outcome?.content ?? outcome ?? '').trim()
-        task.resultMetadata = outcome?.metadata || null
+        task.artifacts = mergeArtifacts(
+          task.artifacts,
+          artifactsFromOutcome(outcome),
+        )
       })
       .catch(error => {
         if (
           task.terminalHandled
           || ['cancelling', 'cancelled'].includes(task.status)
         ) return
-        task.status = 'failed'
+        this.flushProgress(task)
+        transitionTask(task, TaskStatus.FAILED)
         task.error = error?.message || String(error)
       })
       .finally(() => {
@@ -668,15 +715,11 @@ export class TaskManager {
         clearInterval(task.progressTimer)
         task.progressTimer = null
         if (task.timeoutTimer) { clearTimeout(task.timeoutTimer); task.timeoutTimer = null }
-        if (task.progressCheckTimer) { clearInterval(task.progressCheckTimer); task.progressCheckTimer = null }
         task.abortController = null
         task.authorization = null
         if (task.status === 'cancelling') return
         if (task.status === 'cancelled') {
-          if (task.schedulerHeld) {
-            this.scheduler.release(task)
-            task.schedulerHeld = false
-          }
+          this.releaseScheduler(task)
           this.drain()
           return
         }
@@ -684,29 +727,31 @@ export class TaskManager {
         task.elapsedMs = task.startedAt
           ? task.completedAt - task.startedAt
           : 0
-        task.notificationStatus = 'pending'
+        task.notificationStatus = isUserWork(task) ? 'pending' : 'none'
         task.terminalHandled = true
-        if (task.schedulerHeld) {
-          this.scheduler.release(task)
-          task.schedulerHeld = false
-        }
+        this.releaseScheduler(task)
         this.emit(
-          task.status === 'completed' ? 'task.completed' : 'task.failed',
+          task.status === 'completed'
+            ? TaskDomainEvent.COMPLETED
+            : TaskDomainEvent.FAILED,
           task,
         )
-        this.emit('task.notification.pending', task)
+        if (isUserWork(task)) {
+          this.emit(TaskDomainEvent.NOTIFICATION_PENDING, task)
+        }
         task.resolve?.(publicTask(task))
         this.prune()
         this.drain()
       })
   }
 
-  async cancel(id, { ownerId } = {}) {
+  async cancel(id, { ownerId, scope = TaskScope.USER } = {}) {
     const task = this.tasks.get(String(id))
     if (
       !task
+      || normalizeTaskScope(task.scope) !== scope
       || (ownerId !== undefined && task.ownerId !== String(ownerId))
-      || (!CANCELLABLE.has(task.status) && task.status !== 'cancelling')
+      || (!isTaskCancellable(task.status) && task.status !== 'cancelling')
     ) {
       return null
     }
@@ -715,9 +760,9 @@ export class TaskManager {
     if (previousStatus === 'queued' || previousStatus === 'scheduled') {
       return this.finishCancellation(task)
     }
-    task.status = 'cancelling'
+    transitionTask(task, TaskStatus.CANCELLING)
     task.authorization = null
-    this.emit('task.cancelling', task)
+    this.emit(TaskDomainEvent.CANCELLING, task)
     task.cancelPromise = Promise.resolve()
       .then(async () => {
         if (task.canceler) {
@@ -743,23 +788,21 @@ export class TaskManager {
         clearInterval(task.progressTimer)
         task.progressTimer = null
         if (task.timeoutTimer) { clearTimeout(task.timeoutTimer); task.timeoutTimer = null }
-        if (task.progressCheckTimer) { clearInterval(task.progressCheckTimer); task.progressCheckTimer = null }
         task.abortController = null
         task.authorization = null
-        task.status = 'failed'
+        transitionTask(task, TaskStatus.FAILED)
         task.error = `取消失败：${error?.message || String(error)}`
         task.completedAt = Date.now()
         task.elapsedMs = task.startedAt
           ? task.completedAt - task.startedAt
           : 0
-        task.notificationStatus = 'pending'
+        task.notificationStatus = isUserWork(task) ? 'pending' : 'none'
         task.terminalHandled = true
-        if (task.schedulerHeld) {
-          this.scheduler.release(task)
-          task.schedulerHeld = false
+        this.releaseScheduler(task)
+        this.emit(TaskDomainEvent.FAILED, task)
+        if (isUserWork(task)) {
+          this.emit(TaskDomainEvent.NOTIFICATION_PENDING, task)
         }
-        this.emit('task.failed', task)
-        this.emit('task.notification.pending', task)
         task.resolve?.(publicTask(task))
         this.prune()
         this.drain()
@@ -769,7 +812,7 @@ export class TaskManager {
   }
 
   finishCancellation(task) {
-    task.status = 'cancelled'
+    transitionTask(task, TaskStatus.CANCELLED)
     task.authorization = null
     task.completedAt = Date.now()
     task.elapsedMs = task.startedAt
@@ -781,49 +824,44 @@ export class TaskManager {
     clearInterval(task.progressTimer)
     task.progressTimer = null
     if (task.timeoutTimer) { clearTimeout(task.timeoutTimer); task.timeoutTimer = null }
-    if (task.progressCheckTimer) { clearInterval(task.progressCheckTimer); task.progressCheckTimer = null }
     task.abortController = null
-    if (task.schedulerHeld) {
-      this.scheduler.release(task)
-      task.schedulerHeld = false
-    }
-    this.emit('task.cancelled', task)
+    this.releaseScheduler(task)
+    this.emit(TaskDomainEvent.CANCELLED, task)
     task.resolve?.(publicTask(task))
     this.prune()
     this.drain()
     return publicTask(task)
   }
 
-  get(id, { ownerId } = {}) {
+  get(id, { ownerId, scope = TaskScope.USER } = {}) {
     const task = this.tasks.get(String(id))
-    if (!task || (ownerId !== undefined && task.ownerId !== String(ownerId))) {
+    if (
+      !task
+      || normalizeTaskScope(task.scope) !== scope
+      || (ownerId !== undefined && task.ownerId !== String(ownerId))
+    ) {
       return null
     }
     return publicTask(task)
   }
 
-  getByJobId(jobId, { ownerId } = {}) {
-    const normalized = String(jobId || '')
-    const task = [...this.tasks.values()]
-      .filter(item => (
-        item.jobId === normalized
-        && (ownerId === undefined || item.ownerId === String(ownerId))
-      ))
-      .sort((left, right) => right.createdAt - left.createdAt)[0]
-    return task ? publicTask(task) : null
+  getByTaskId(taskId, { ownerId } = {}) {
+    return this.get(taskId, { ownerId, scope: TaskScope.USER })
   }
 
   list({
     ownerId,
     sessionId,
     active = false,
+    scope = TaskScope.USER,
   } = {}) {
     this.prune()
     return [...this.tasks.values()]
       .filter(task => (
-        (ownerId === undefined || task.ownerId === String(ownerId))
+        (scope === 'all' || normalizeTaskScope(task.scope) === scope)
+        && (ownerId === undefined || task.ownerId === String(ownerId))
         && (sessionId === undefined || task.sessionId === String(sessionId))
-        && (!active || ACTIVE.has(task.status))
+        && (!active || isTaskActive(task.status))
       ))
       .sort((left, right) => right.createdAt - left.createdAt)
       .map(publicTask)
@@ -841,107 +879,29 @@ export class TaskManager {
     claimantId,
     taskIds,
   }) {
-    this.reclaimExpiredNotificationClaims()
-    const requested = taskIds?.length ? new Set(taskIds.map(String)) : null
-    const claimed = []
-    for (const task of this.tasks.values()) {
-      if (
-        task.ownerId !== String(ownerId)
-        || task.notificationStatus !== 'pending'
-        || (
-          sessionId !== undefined
-          && !includeOtherSessions
-          && task.sessionId !== String(sessionId)
-        )
-        || (requested && !requested.has(task.id))
-      ) continue
-      task.notificationStatus = 'delivering'
-      task.notificationClaimantId = claimantId
-      task.notificationClaimedAt = Date.now()
-      claimed.push(publicTask(task))
-    }
-    if (claimed.length) this.persist()
-    return claimed.sort((a, b) => a.createdAt - b.createdAt)
+    return this.notifications.claim({
+      ownerId,
+      sessionId,
+      includeOtherSessions,
+      claimantId,
+      taskIds,
+    })
   }
 
   markNotificationsDelivered(taskIds, { claimantId } = {}) {
-    let delivered = 0
-    for (const id of taskIds || []) {
-      const task = this.tasks.get(String(id))
-      if (
-        !task
-        || task.notificationStatus !== 'delivering'
-        || (
-          claimantId !== undefined
-          && task.notificationClaimantId !== claimantId
-        )
-      ) continue
-      task.notificationStatus = 'delivered'
-      task.notificationClaimantId = null
-      task.notificationClaimedAt = null
-      task.notificationDeliveredAt = Date.now()
-      delivered += 1
-      this.emit('task.notification.delivered', task, { persist: false })
-    }
-    if (delivered) this.persist()
-    return delivered
+    return this.notifications.markDelivered(taskIds, { claimantId })
   }
 
   renewNotificationClaims(taskIds, { claimantId } = {}) {
-    let renewed = 0
-    const now = Date.now()
-    for (const id of taskIds || []) {
-      const task = this.tasks.get(String(id))
-      if (
-        !task
-        || task.notificationStatus !== 'delivering'
-        || (
-          claimantId !== undefined
-          && task.notificationClaimantId !== claimantId
-        )
-      ) continue
-      task.notificationClaimedAt = now
-      renewed += 1
-    }
-    return renewed
+    return this.notifications.renew(taskIds, { claimantId })
   }
 
   releaseNotificationClaims(taskIds, { claimantId } = {}) {
-    let released = 0
-    for (const id of taskIds || []) {
-      const task = this.tasks.get(String(id))
-      if (
-        !task
-        || task.notificationStatus !== 'delivering'
-        || (
-          claimantId !== undefined
-          && task.notificationClaimantId !== claimantId
-        )
-      ) continue
-      task.notificationStatus = 'pending'
-      task.notificationClaimantId = null
-      task.notificationClaimedAt = null
-      released += 1
-    }
-    if (released) this.persist()
-    return released
+    return this.notifications.release(taskIds, { claimantId })
   }
 
   reclaimExpiredNotificationClaims(now = Date.now(), { persist = true } = {}) {
-    let reclaimed = 0
-    for (const task of this.tasks.values()) {
-      if (
-        task.notificationStatus !== 'delivering'
-        || !task.notificationClaimedAt
-        || now - task.notificationClaimedAt < this.notificationClaimTtlMs
-      ) continue
-      task.notificationStatus = 'pending'
-      task.notificationClaimantId = null
-      task.notificationClaimedAt = null
-      reclaimed += 1
-    }
-    if (reclaimed && persist) this.persist()
-    return reclaimed
+    return this.notifications.reclaimExpired(now, { persist })
   }
 
   prune() {
@@ -949,7 +909,7 @@ export class TaskManager {
     let changed = this.reclaimExpiredNotificationClaims(now, { persist: false }) > 0
     const terminalByOwner = new Map()
     for (const task of this.tasks.values()) {
-      if (!TERMINAL.has(task.status)) continue
+      if (!isTaskTerminal(task.status)) continue
       const age = now - (task.completedAt || task.createdAt)
       const awaitingDelivery = ['pending', 'delivering'].includes(
         task.notificationStatus,
@@ -985,6 +945,11 @@ export const taskStore = new TaskStore({
   onWarning: warning => logger.warn('task.persistence_warning', { warning }),
 })
 
+export const taskSessionJournal = new SessionJournalRegistry({
+  directory: resolve(config.configDirectory, 'sessions'),
+  logger,
+})
+
 export const taskManager = new TaskManager({
   store: taskStore,
   logger,
@@ -993,4 +958,5 @@ export const taskManager = new TaskManager({
   terminalTtlMs: config.taskTerminalTtlMs,
   pendingNotificationTtlMs: config.taskPendingNotificationTtlMs,
   maxTerminalTasksPerOwner: config.maxTerminalTasksPerOwner,
+  sessionJournal: taskSessionJournal,
 })

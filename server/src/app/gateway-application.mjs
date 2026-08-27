@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { resolve } from 'path'
 import { agent as defaultAgent } from '../agent/agent-client.mjs'
 import { BackendAvailability } from '../agent/backend-availability.mjs'
-import { coordinator as defaultCoordinator } from '../agent/coordinator.mjs'
+import { BackendWorkRuntime } from '../backend/backend-work-runtime.mjs'
 import { config as defaultConfig } from '../core/config.mjs'
 import { logger as defaultLogger, runWithLogContext } from '../core/logger.mjs'
 import { conversationSync as defaultConversationSync } from '../conversation/conversation-sync.mjs'
@@ -18,6 +18,8 @@ import {
 } from '../conversation/memory-extractor.mjs'
 import { FrontendMemoryService } from '../conversation/frontend-memory-service.mjs'
 import { MarkdownContextStore } from '../conversation/markdown-context-store.mjs'
+import { FrontendMemoryRuntime } from '../conversation/memory-runtime.mjs'
+import { SessionConversationHistory } from './session-conversation-history.mjs'
 import { enforceSameOrigin } from '../core/request-security.mjs'
 import {
   GATEWAY_PROTOCOL_VERSION,
@@ -33,15 +35,40 @@ import { SessionPermissionPolicy } from '../voice/session-permission-policy.mjs'
 import {
   taskManager as defaultTaskManager,
   taskStore as defaultTaskStore,
+  taskSessionJournal as defaultTaskSessionJournal,
 } from '../task/task-manager.mjs'
 import { ReminderScheduler } from '../task/reminder-scheduler.mjs'
 import { webDistributionPath } from '../core/install-paths.mjs'
 import { installOfflineNotifications } from './offline-notifications.mjs'
+import {
+  FrontendRetrievalRuntime,
+} from '../frontend/retrieval/frontend-retrieval-runtime.mjs'
+import { createWebSearchProvider } from '../providers/search/factory.mjs'
+import { FrontendKnowledgeRuntime } from '../frontend/knowledge/knowledge-runtime.mjs'
+import { assertFrontendToolSource } from '../frontend/tools/frontend-tool-source.mjs'
+import { FrontendMcpClient } from '../providers/mcp/frontend-mcp-client.mjs'
+import {
+  loadFrontendMcpConfiguration,
+} from '../providers/mcp/frontend-mcp-config.mjs'
+import {
+  FrontendOpenApiAdapter,
+} from '../providers/openapi/frontend-openapi-adapter.mjs'
+import {
+  loadFrontendOpenApiConfiguration,
+} from '../providers/openapi/frontend-openapi-config.mjs'
+import {
+  projectGatewayTaskEvent,
+  projectGatewayTaskSnapshot,
+} from '../transport/gateway-task-event-projector.mjs'
+import {
+  projectGatewayTaskEventForFormat,
+} from '../transport/agui-event-projector.mjs'
+import { replaySession } from '../session/session-replay.mjs'
 
 export function createGatewayApplication({
   config = defaultConfig,
   agent = defaultAgent,
-  coordinator = defaultCoordinator,
+  backendRuntime = null,
   conversationSync = defaultConversationSync,
   inputAssets = null,
   taskManager = defaultTaskManager,
@@ -51,11 +78,91 @@ export function createGatewayApplication({
   autoStart = true,
   realtimeProviderRegistry = defaultRealtimeProviderRegistry,
   realtimeProvider = config.audioProvider,
+  webSearchProvider = undefined,
+  urlFetcher = undefined,
+  frontendRetrieval = null,
+  memoryProvider = undefined,
+  frontendMemory = null,
+  knowledgeProvider = null,
+  // Compatibility alias for embedders that adopted the original injection name.
+  knowledgeRetrievalProvider = null,
+  frontendKnowledge = null,
+  frontendMcp = undefined,
+  frontendOpenApi = undefined,
+  sessionJournal = null,
+  conversationHistory = null,
+  taskAnnouncementFactory = undefined,
 } = {}) {
+const workBackend = backendRuntime || new BackendWorkRuntime({ backend: agent })
+const sessionJournalRuntime = sessionJournal || defaultTaskSessionJournal
+const conversationHistoryRuntime = conversationHistory || new SessionConversationHistory({
+  conversationSync,
+  sessionJournal: sessionJournalRuntime,
+  logger,
+})
+const restoredConversationMessages = conversationHistoryRuntime.start?.() || 0
+if (restoredConversationMessages) {
+  logger.info('conversation_history.restored', {
+    messages: restoredConversationMessages,
+  })
+}
 const inputAssetRegistry = inputAssets || new InputAssetRegistry({
   sessionTtlMs: config.conversationSessionTtlMs,
   maxSessions: config.maxConversationSessions,
 })
+const knowledgeProviderRuntime = knowledgeProvider || knowledgeRetrievalProvider
+const frontendKnowledgeRuntime = frontendKnowledge || (knowledgeProviderRuntime
+  ? new FrontendKnowledgeRuntime({ provider: knowledgeProviderRuntime })
+  : null)
+const retrievalRuntime = frontendRetrieval || new FrontendRetrievalRuntime({
+  searchProvider: webSearchProvider === undefined
+    ? createWebSearchProvider(config)
+    : webSearchProvider,
+  ...(urlFetcher === undefined ? {} : { urlFetcher }),
+})
+const frontendMcpRuntime = frontendMcp === undefined
+  ? new FrontendMcpClient({
+      configuration: loadFrontendMcpConfiguration({
+        filePath: config.frontendMcpConfigPath || '',
+      }),
+    })
+  : frontendMcp
+const frontendOpenApiRuntime = frontendOpenApi === undefined
+  ? new FrontendOpenApiAdapter({
+      configuration: loadFrontendOpenApiConfiguration({
+        filePath: config.frontendOpenApiConfigPath || '',
+      }),
+    })
+  : frontendOpenApi
+// TaskManager remains the owner of task state. The journal receives an
+// immutable event copy so recovery and replay do not depend on its in-memory
+// Map or on the current task projection.
+const unsubscribeSessionTaskJournal = taskManager.subscribe(event => {
+  const task = event?.task
+  if (!task?.id) return
+  sessionJournalRuntime.append({
+    ownerId: event.ownerId || task.ownerId,
+    sessionId: task.sessionId || 'main',
+    event: {
+      type: 'qwaudio/task/event',
+      eventId: event.eventId || randomUUID(),
+      turnId: task.turnId || null,
+      taskId: task.id,
+      source: 'task-manager',
+      payload: {
+        domainType: event.type,
+        task,
+        details: Object.fromEntries(
+          Object.entries(event).filter(([key]) => !['type', 'ownerId', 'task'].includes(key)),
+        ),
+      },
+    },
+  })
+}, { scope: 'all' })
+const frontendToolSources = [
+  frontendMcpRuntime,
+  frontendOpenApiRuntime,
+].filter(Boolean).map(source => assertFrontendToolSource(source))
 const identityManager = new IdentityManager({
   secret: config.authSecret,
   mode: config.identityMode,
@@ -70,11 +177,19 @@ taskManager.configureRetention({
   notificationClaimTtlMs: config.taskNotificationClaimTtlMs,
   maxTerminalTasksPerOwner: config.maxTerminalTasksPerOwner,
 })
+// Recover records missing from the compact task snapshot by replaying the
+// latest task projection found in durable Session Journals.
+const restoredJournalTasks = taskManager.sessionJournal === sessionJournalRuntime
+  ? 0
+  : taskManager.restoreFromJournal(sessionJournalRuntime)
+if (restoredJournalTasks) {
+  logger.info('session_journal.tasks_restored', { count: restoredJournalTasks })
+}
 taskManager.recoverDelegated({
   canRecover: task => agent.canRecoverDelegatedWork(task),
   runner: (task, context) => agent.recoverDelegatedWork(task, context),
   canceler: async (task, { abort }) => {
-    const result = await agent.cancelWork(task.id, {
+    const result = await agent.cancel(task.id, {
       ownerId: task.ownerId,
     })
     abort()
@@ -93,43 +208,48 @@ conversationSync.configureRetention({
   sessionTtlMs: config.conversationSessionTtlMs,
   maxSessions: config.maxConversationSessions,
 })
-const userDocuments = new MarkdownContextStore({
-  filePath: config.userModelPath,
-  scope: 'user',
-  personalOwnerId: config.personalOwnerId,
-  maxChars: 6000,
-  template: '# USER',
-  onWarning: warning => logger.warn('user_model.persistence_warning', { warning }),
-})
-const memoryDocuments = new MarkdownContextStore({
-  filePath: config.frontendMemoryPath,
-  scope: 'memory',
-  personalOwnerId: config.personalOwnerId,
-  maxChars: 8000,
-  template: '# MEMORY',
-  onWarning: warning => logger.warn('memory.persistence_warning', { warning }),
-})
-const frontendMemoryService = new FrontendMemoryService({
-  userStore: userDocuments,
-  memoryStore: memoryDocuments,
-})
-// Restored scheduled tasks use persisted identity and resolve current memory
-// at execution time, exactly like tasks created by a live voice session.
+// The built-in Markdown provider preserves the existing USER.md/MEMORY.md
+// behaviour. Embedders can replace the entire persistence boundary without
+// changing Realtime, extraction, or tool handling code.
+let defaultMemoryProvider = null
+if (memoryProvider === undefined && !frontendMemory) {
+  const userDocuments = new MarkdownContextStore({
+    filePath: config.userModelPath,
+    scope: 'user',
+    personalOwnerId: config.personalOwnerId,
+    maxChars: 6000,
+    template: '# USER',
+    onWarning: warning => logger.warn('user_model.persistence_warning', { warning }),
+  })
+  const memoryDocuments = new MarkdownContextStore({
+    filePath: config.frontendMemoryPath,
+    scope: 'memory',
+    personalOwnerId: config.personalOwnerId,
+    maxChars: 8000,
+    template: '# MEMORY',
+    onWarning: warning => logger.warn('memory.persistence_warning', { warning }),
+  })
+  defaultMemoryProvider = new FrontendMemoryService({
+    userStore: userDocuments,
+    memoryStore: memoryDocuments,
+  })
+}
+const memoryProviderRuntime = memoryProvider === undefined
+  ? defaultMemoryProvider
+  : memoryProvider
+const frontendMemoryRuntime = frontendMemory || (memoryProviderRuntime
+  ? new FrontendMemoryRuntime({ provider: memoryProviderRuntime })
+  : null)
+// Restored scheduled tasks submit the same self-contained Work input as live
+// requests. Frontend conversation history and memory stay at the frontend.
 taskManager.configureScheduledTaskRunner(
-  async (objective, context) => coordinator.run({
-    originalRequest: objective,
+  async (objective, context) => workBackend.run({
     objective,
-    conversationContext: [],
-    userMemories: frontendMemoryService.list(
-      context.ownerId,
-      { limit: 64 },
-    ),
   }, {
     ownerId: context.ownerId,
     sessionId: context.sessionId,
     turnId: context.turnId,
-    coordinationRunId: context.taskId,
-    coordinationRequestId: context.jobId,
+    taskId: context.taskId,
     signal: context.signal,
     onEvent: context.onEvent,
   }),
@@ -162,7 +282,7 @@ const memoryAudit = new MemoryAudit({
   onWarning: warning => logger.warn('memory.audit_warning', { warning }),
 })
 const memoryExtractor = new MemoryExtractor({
-  memoryService: frontendMemoryService,
+  memoryService: frontendMemoryRuntime,
   conversationSync,
   audit: memoryAudit,
   llmCall: config.memoryAutoEnabled
@@ -253,7 +373,34 @@ app.get('/api/health', (req, res) => {
     resultContextMaxChars: config.resultContextMaxChars,
     announcementBatchMs: config.announcementBatchMs,
     announcementQuietMs: config.announcementQuietMs,
-    frontendMemory: frontendMemoryService.health(),
+    frontendMemory: frontendMemoryRuntime?.health() || {
+      ok: true,
+      configured: false,
+      provider: null,
+    },
+    frontendProfile: config.frontendProfile || {
+      configured: false,
+      name: 'default',
+      description: '',
+    },
+    frontendRetrieval: retrievalRuntime.describe(),
+    frontendKnowledge: frontendKnowledgeRuntime?.describe() || {
+      configured: false,
+      capabilities: [],
+      provider: null,
+    },
+    frontendMcp: frontendMcpRuntime?.health?.() || {
+      ok: true,
+      initialized: true,
+      tools: 0,
+      servers: [],
+    },
+    frontendOpenApi: frontendOpenApiRuntime?.health?.() || {
+      ok: true,
+      initialized: true,
+      tools: 0,
+      apis: [],
+    },
     notes: notesStore.health(),
     taskStore: taskStore.health(),
     identityMode: config.identityMode,
@@ -323,21 +470,45 @@ app.get('/api/tasks', (req, res) => {
   })
 })
 
-app.get('/api/timeline', (req, res) => {
-  const items = taskManager.list({
-    ownerId: req.identity.ownerId,
-    sessionId: req.query.sessionId,
-  })
-    .filter(task => task.resultMetadata?.presentation?.inline?.content)
-    .map(task => ({
-      id: `inline_${task.id}`,
-      taskId: task.id,
-      turnId: task.turnId || null,
-      createdAt: task.completedAt || task.createdAt,
-      ...task.resultMetadata.presentation.inline,
-    }))
-    .sort((left, right) => left.createdAt - right.createdAt)
-  res.json({ items })
+// Durable session facts are intentionally exposed separately from UI state.
+// Clients may use this for reconnect/recovery; projections should not need to
+// understand the on-disk JSONL format.
+app.get('/api/sessions/:sessionId/events', async (req, res, next) => {
+  try {
+    const events = await sessionJournalRuntime.read(
+      req.identity.ownerId,
+      req.params.sessionId,
+    )
+    res.json({ events })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/sessions/:sessionId/replay', async (req, res, next) => {
+  try {
+    const events = await sessionJournalRuntime.read(
+      req.identity.ownerId,
+      req.params.sessionId,
+    )
+    res.json({ replay: replaySession(events, { sessionId: req.params.sessionId }) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+// Stable, bounded UI projection. Clients never depend on Session Journal
+// records or diagnostic logs, and Realtime consumes this same projection.
+app.get('/api/conversations/:sessionId/messages', async (req, res, next) => {
+  try {
+    const messages = await conversationHistoryRuntime.messages({
+      ownerId: req.identity.ownerId,
+      sessionId: req.params.sessionId,
+    })
+    res.json({ messages })
+  } catch (error) {
+    next(error)
+  }
 })
 
 app.get('/api/tasks/:id', (req, res) => {
@@ -372,25 +543,28 @@ app.post('/api/permissions/:id', async (req, res, next) => {
     ownerId: req.identity.ownerId,
     active: true,
   }).find(task => task.authorization?.id === req.params.id)
-  const previousPermissionMode = permissionTask
-    ? permissionPolicy.mode(req.identity.ownerId, permissionTask.sessionId)
-    : null
-  if (permissionTask) {
-    permissionPolicy.applyDecision(
-      req.identity.ownerId,
-      permissionTask.sessionId,
-      decision,
-    )
+  if (!permissionTask) {
+    return res.status(404).json({ error: 'permission request not found' })
   }
+  const previousPermissionMode = permissionPolicy.mode(
+    req.identity.ownerId,
+    permissionTask.sessionId,
+  )
+  permissionPolicy.applyDecision(
+    req.identity.ownerId,
+    permissionTask.sessionId,
+    decision,
+  )
   try {
-    const permission = await agent.respondPermission(
+    const permission = await agent.respondAuthorization(
+      permissionTask.id,
       req.params.id,
       decision,
       { ownerId: req.identity.ownerId },
     )
     return res.json(permission)
   } catch (error) {
-    if (permissionTask && previousPermissionMode) {
+    if (previousPermissionMode) {
       permissionPolicy.setMode(
         req.identity.ownerId,
         permissionTask.sessionId,
@@ -407,15 +581,20 @@ app.post('/api/permissions/:id', async (req, res, next) => {
 app.get('/api/tasks/:id/events', (req, res) => {
   const task = taskManager.get(req.params.id, { ownerId: req.identity.ownerId })
   if (!task) return res.status(404).json({ error: 'task not found' })
+  const projectEvent = event => projectGatewayTaskEventForFormat(
+    event,
+    req.query.format,
+  )
   res.setHeader('Content-Type', 'text/event-stream')
   res.setHeader('Cache-Control', 'no-cache')
   res.setHeader('Connection', 'keep-alive')
   res.flushHeaders()
   const write = event => res.write(`data: ${JSON.stringify(event)}\n\n`)
-  write({ type: 'task.snapshot', task })
+  write(projectEvent(projectGatewayTaskSnapshot(task)))
   const unsubscribe = taskManager.subscribe(event => {
     if (event.ownerId === req.identity.ownerId && event.task.id === req.params.id) {
-      write({ type: event.type, task: event.task })
+      const publicEvent = projectGatewayTaskEvent(event)
+      if (publicEvent) write(projectEvent(publicEvent))
     }
   })
   res.on('close', unsubscribe)
@@ -455,7 +634,7 @@ const backendAvailability = new BackendAvailability({
     return {
       configured: true,
       ok: health.ok === true,
-      // A managed service and its ACP bridge come online in stages. Preserve
+      // A managed service and its adapter transport come online in stages. Preserve
       // that distinction so receipt-based work is not rejected from a stale
       // cold-start probe, and keep advancing initialization in the background.
       transient: health.status === 'starting'
@@ -466,13 +645,13 @@ const backendAvailability = new BackendAvailability({
 backendAvailability.refresh()
 realtimeGateway = attachRealtimeGateway(server, {
   identityManager,
-  memoryService: frontendMemoryService,
+  memoryService: frontendMemoryRuntime,
   memoryExtractor,
   notesStore,
-  coordinator,
+  backendRuntime: workBackend,
   backendAvailability,
-  respondPermission: (id, decision, options) => (
-    agent.respondPermission(id, decision, options)
+  respondAuthorization: (taskId, id, decision, options) => (
+    agent.respondAuthorization(taskId, id, decision, options)
   ),
   permissionPolicy,
   inputAssets: inputAssetRegistry,
@@ -485,6 +664,10 @@ realtimeGateway = attachRealtimeGateway(server, {
     timeoutMs: config.dictationTimeoutMs,
     memoryAudit,
   },
+  frontendRetrieval: retrievalRuntime,
+  frontendKnowledge: frontendKnowledgeRuntime,
+  frontendToolSources,
+  taskAnnouncementFactory,
 })
 const start = ({ host = config.host, port = config.port } = {}) => {
   if (server.listening) return server
@@ -524,6 +707,13 @@ const close = () => {
     // not survive into the next run.
     inputArbitration.close()
     await realtimeGateway?.close?.()
+    await frontendMcpRuntime?.close?.()
+    await frontendOpenApiRuntime?.close?.()
+    await frontendKnowledgeRuntime?.close?.()
+    await frontendMemoryRuntime?.close?.()
+    unsubscribeSessionTaskJournal?.()
+    conversationHistoryRuntime.close?.()
+    await sessionJournalRuntime.flush()
     await taskStore?.flush?.()
     if (!server.listening) return
     await new Promise((resolveClose, rejectClose) => {
@@ -547,8 +737,18 @@ return {
     agent,
     backendAvailability,
     conversationSync,
-    coordinator,
-    frontendMemoryService,
+    conversationHistory: conversationHistoryRuntime,
+    backendRuntime: workBackend,
+    // Preserve the original service handle for embedders using the built-in
+    // synchronous Markdown API. New integrations should use frontendMemory.
+    frontendMemoryService: memoryProviderRuntime,
+    frontendMemory: frontendMemoryRuntime,
+    memoryProvider: memoryProviderRuntime,
+    frontendRetrieval: retrievalRuntime,
+    frontendKnowledge: frontendKnowledgeRuntime,
+    frontendMcp: frontendMcpRuntime,
+    frontendOpenApi: frontendOpenApiRuntime,
+    knowledgeProvider: knowledgeProviderRuntime,
     identityManager,
     inputArbitration,
     inputAssets: inputAssetRegistry,
@@ -557,6 +757,7 @@ return {
     realtimeGateway,
     taskManager,
     taskStore,
+    sessionJournal: sessionJournalRuntime,
   },
 }
 }

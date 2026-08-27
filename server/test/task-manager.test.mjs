@@ -2,27 +2,26 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { TaskManager } from '../src/task/task-manager.mjs'
 
-test('assigns short model-facing job ids independently of internal work ids', () => {
+test('uses one short task id across the public and execution layers', () => {
   const manager = new TaskManager()
   const first = manager.create({ objective: 'A', ownerId: 'owner' })
   const second = manager.create({ objective: 'B', ownerId: 'owner' })
 
-  assert.equal(first.jobId, 'job_1')
-  assert.equal(second.jobId, 'job_2')
-  assert.match(first.id, /^work_[0-9a-f-]{36}$/)
+  assert.equal(first.id, 'task_1')
+  assert.equal(second.id, 'task_2')
   assert.notEqual(first.id, second.id)
-  assert.equal(manager.getByJobId('job_2', { ownerId: 'owner' }).id, second.id)
+  assert.equal(manager.getByTaskId('task_2', { ownerId: 'owner' }).id, second.id)
 })
 
-test('cycles model-facing job ids after 99999', () => {
+test('cycles short task ids after 99999 without reusing retained records', () => {
   const manager = new TaskManager()
-  manager.nextJobNumber = 99_999
+  manager.nextTaskNumber = 99_999
 
   const last = manager.create({ objective: 'last', ownerId: 'owner' })
   const first = manager.create({ objective: 'first', ownerId: 'owner' })
 
-  assert.equal(last.jobId, 'job_99999')
-  assert.equal(first.jobId, 'job_1')
+  assert.equal(last.id, 'task_99999')
+  assert.equal(first.id, 'task_1')
   assert.notEqual(last.id, first.id)
 })
 
@@ -69,6 +68,109 @@ test('serializes work in the same coordinator lane while accepting immediately',
   assert.deepEqual(order, ['A:start', 'A:end', 'B:start'])
 })
 
+test('moves updated backend activity to the end so recency stays correct', async () => {
+  const manager = new TaskManager()
+  const task = manager.create({
+    objective: 'A',
+    ownerId: 'owner',
+    runner: async (_objective, { onEvent }) => {
+      onEvent({
+        type: 'backend.activity',
+        activity: { id: 'thinking', kind: 'thinking', status: 'running' },
+      })
+      onEvent({
+        type: 'backend.activity',
+        activity: { id: 'tool', kind: 'tool', status: 'running' },
+      })
+      onEvent({
+        type: 'backend.activity',
+        activity: { id: 'thinking', kind: 'thinking', status: 'running' },
+      })
+      return { content: 'done' }
+    },
+  })
+
+  await manager.wait(task.id)
+  assert.deepEqual(
+    manager.get(task.id).activity.map(activity => activity.id),
+    ['tool', 'thinking'],
+  )
+})
+
+test('coalesces streaming backend activity and messages into bounded progress events', async () => {
+  const manager = new TaskManager({ progressEventIntervalMs: 60_000 })
+  const events = []
+  manager.subscribe(event => events.push(event))
+  const task = manager.create({
+    objective: 'A',
+    ownerId: 'owner',
+    runner: async (_objective, { onEvent }) => {
+      for (let index = 1; index <= 100; index += 1) {
+        onEvent({
+          type: 'backend.activity',
+          activity: {
+            id: 'thinking',
+            kind: 'thinking',
+            status: 'running',
+          },
+        })
+        onEvent({
+          type: 'backend.message',
+          message: `正在处理 ${index}`,
+        })
+      }
+      return { content: 'done' }
+    },
+  })
+
+  await manager.wait(task.id)
+
+  assert.equal(
+    events.filter(event => event.type === 'task.progress').length,
+    0,
+  )
+  assert.equal(
+    events.filter(event => event.type === 'task.updated').length,
+    1,
+  )
+  assert.equal(manager.get(task.id).message, '正在处理 100')
+})
+
+test('persists normalized backend messages and artifacts as Task updates', async () => {
+  const manager = new TaskManager()
+  const events = []
+  manager.subscribe(event => events.push(event))
+  const task = manager.create({
+    objective: '生成报告',
+    ownerId: 'owner',
+    runner: async (_objective, { onEvent }) => {
+      onEvent({
+        type: 'backend.message',
+        message: '已完成资料整理。',
+      })
+      onEvent({
+        type: 'backend.artifact',
+        artifact: {
+          artifactId: 'report',
+          name: '报告',
+          parts: [{ text: '# 结果', mediaType: 'text/markdown' }],
+        },
+      })
+      return { content: '完成' }
+    },
+  })
+
+  await manager.wait(task.id)
+
+  const completed = manager.get(task.id)
+  assert.equal(completed.message, '已完成资料整理。')
+  assert.equal(completed.artifacts[0].artifactId, 'report')
+  assert.equal(
+    events.filter(event => event.type === 'task.updated').length,
+    2,
+  )
+})
+
 test('publishes a bounded pending permission on the active work', async () => {
   const manager = new TaskManager()
   let release
@@ -83,7 +185,7 @@ test('publishes a bounded pending permission on the active work', async () => {
         type: 'backend.permission.requested',
         permission: {
           id: 'auth_one',
-          workId: 'work_one',
+          taskId: 'work_one',
           status: 'pending',
           category: 'bash',
           summary: '运行命令：npm test',
@@ -94,7 +196,11 @@ test('publishes a bounded pending permission on the active work', async () => {
     },
   })
   await new Promise(resolve => setImmediate(resolve))
-  assert.equal(manager.get(task.id).authorization.id, 'auth_one')
+  const pending = manager.get(task.id)
+  assert.equal(pending.authorization.id, 'auth_one')
+  assert.equal(pending.authorization.taskId, task.id)
+  assert.equal(pending.workState, 'auth_required')
+  assert.equal(Number.isFinite(pending.authorization.createdAt), true)
   assert.equal(
     events.some(event => event.type === 'task.permission.requested'),
     true,
@@ -107,7 +213,7 @@ test('drops stale permissions restored on terminal work', () => {
   const manager = new TaskManager({
     store: {
       load: () => [{
-        id: 'work-complete',
+        id: 'task_90',
         status: 'completed',
         objective: '检查目录',
         ownerId: 'owner',
@@ -122,7 +228,7 @@ test('drops stale permissions restored on terminal work', () => {
     },
   })
 
-  assert.equal(manager.get('work-complete').authorization, null)
+  assert.equal(manager.get('task_90').authorization, null)
 })
 
 test('keeps delegated work active while releasing its coordinator lane', async () => {
@@ -145,8 +251,11 @@ test('keeps delegated work active while releasing its coordinator lane', async (
           title: '已有项目',
           directory: '/project',
           presentation: {
-            speech: '项目已经接着做了。',
-            inline: null,
+            inline: {
+              title: '已有项目',
+              format: 'markdown',
+              content: '项目已经接着做了。',
+            },
           },
         },
       })
@@ -168,13 +277,10 @@ test('keeps delegated work active while releasing its coordinator lane', async (
 
   const delegated = manager.get(task.id)
   assert.equal(delegated.status, 'delegated')
-  assert.equal(delegated.workState, 'active')
+  assert.equal(delegated.workState, 'working')
   assert.equal(delegated.delegation.status, 'running')
   assert.equal(delegated.delegation.title, '已有项目')
-  assert.equal(
-    delegated.delegation.presentation.speech,
-    '项目已经接着做了。',
-  )
+  assert.equal('presentation' in delegated.delegation, false)
   assert.ok(events.some(event => event.type === 'task.delegated'))
   assert.equal(secondStarted, true)
   assert.equal(manager.get(second.id).status, 'completed')
@@ -419,7 +525,7 @@ test('listing tasks does not rewrite unchanged persistent state', async () => {
   assert.equal(saves, before)
 })
 
-test('publishes only presentation metadata from a completed result', async () => {
+test('publishes standard artifacts from a completed result', async () => {
   const events = []
   const manager = new TaskManager()
   manager.subscribe(event => events.push(event))
@@ -429,15 +535,12 @@ test('publishes only presentation metadata from a completed result', async () =>
     sessionId: 'voice',
     runner: async () => ({
       content: '报告已经生成',
+      artifacts: [{
+        artifactId: 'report',
+        name: '报告',
+        parts: [{ text: '# 完成', mediaType: 'text/markdown' }],
+      }],
       metadata: {
-        presentation: {
-          speech: '报告已经生成。',
-          inline: {
-            title: '报告',
-            format: 'markdown',
-            content: '# 完成',
-          },
-        },
         backendRef: {
           sessionId: 'backend-session',
           directory: '/private/project',
@@ -451,38 +554,37 @@ test('publishes only presentation metadata from a completed result', async () =>
   })
 
   const completed = await manager.wait(task.id)
-  assert.deepEqual(completed.resultMetadata, {
-    presentation: {
-      speech: '报告已经生成。',
-      inline: {
-        title: '报告',
-        format: 'markdown',
-        content: '# 完成',
-      },
-    },
-  })
+  assert.equal('presentation' in completed, false)
+  assert.deepEqual(completed.artifacts, [{
+    artifactId: 'report',
+    name: '报告',
+    parts: [{ text: '# 完成', mediaType: 'text/markdown' }],
+  }])
   assert.deepEqual(
     events.find(event => event.type === 'task.completed')
-      ?.task.resultMetadata,
-    completed.resultMetadata,
+      ?.task.artifacts,
+    completed.artifacts,
   )
 })
 
-test('projects legacy decision presentation when restoring a task', () => {
+test('drops legacy presentation while preserving standard artifacts on restore', () => {
   let saved = []
   const manager = new TaskManager({
     store: {
       load: () => [{
-        id: 'legacy-work',
+        id: 'task_92',
         status: 'completed',
         objective: '旧任务',
         ownerId: 'owner',
         sessionId: 'voice',
         result: '旧结果',
+        artifacts: [{
+          artifactId: 'legacy-result',
+          parts: [{ text: 'const done = true', mediaType: 'text/plain' }],
+        }],
         resultMetadata: {
           decision: {
             presentation: {
-              speech: '旧任务已经完成。',
               inline: {
                 title: '旧结果',
                 format: 'code',
@@ -500,17 +602,10 @@ test('projects legacy decision presentation when restoring a task', () => {
     },
   })
 
-  const restored = manager.get('legacy-work')
-  assert.deepEqual(restored.resultMetadata, {
-    presentation: {
-      speech: '旧任务已经完成。',
-      inline: {
-        title: '旧结果',
-        format: 'code',
-        content: 'const done = true',
-      },
-    },
-  })
+  const restored = manager.get('task_92')
+  assert.equal('presentation' in restored, false)
   manager.persist()
-  assert.deepEqual(saved[0].resultMetadata, restored.resultMetadata)
+  assert.deepEqual(saved[0].artifacts, restored.artifacts)
+  assert.equal('presentation' in saved[0], false)
+  assert.equal('resultMetadata' in saved[0], false)
 })

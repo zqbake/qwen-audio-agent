@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   CANCEL_AGENT_TASK_TOOL_NAME,
   SCHEDULE_REMINDER_TOOL_NAME,
@@ -9,18 +9,33 @@ import {
   NOTES_TOOL_NAME,
   MEMORY_TOOL_NAME,
   RESPOND_AGENT_PERMISSION_TOOL_NAME,
-} from '../realtime-provider.mjs'
+  RESPOND_FRONTEND_TOOL_PERMISSION_NAME,
+  WEB_SEARCH_TOOL_NAME,
+  FETCH_URL_TOOL_NAME,
+  KNOWLEDGE_TOOL_NAME,
+  frontendToolRegistry,
+} from '../frontend-tools.mjs'
+import {
+  findFrontendSourceTool,
+  frontendSourceToolCapabilities,
+} from '../../frontend/tools/frontend-tool-source.mjs'
+import {
+  boundFrontendToolResult,
+  FrontendToolLoop,
+} from './frontend-tool-loop.mjs'
 import { currentTimeSnapshot } from '../../conversation/frontend-agent-context.mjs'
 import { canonicalScope, isMemoryDocument } from '../../core/memory-scopes.mjs'
 import { inputPartRef } from '../../../../shared/input-parts.mjs'
 import { containsSensitiveMemory } from '../../conversation/memory-policy.mjs'
+import { BackendEventType } from '../../core/backend-events.mjs'
 
 const CANCEL_RECEIPT_INSTRUCTIONS = [
   '根据本次响应中的全部取消结果，只作一次简短自然的确认。',
-  '不要逐项复述 job_id，不要再次查询或取消，不要调用其他工具。',
+  '不要逐项复述 task_id，不要再次查询或取消，不要调用其他工具。',
 ].join(' ')
 
-const STATUS_RESULT_MESSAGE = '请根据这次查询结果自然回答用户；不要再次调用状态工具，不要展示 job_id。'
+const STATUS_RESULT_MESSAGE = '请根据这次查询结果自然回答用户；不要再次调用状态工具，不要展示 task_id。'
+const MAX_PENDING_EXTERNAL_AUTHORIZATIONS = 8
 
 function objectiveFingerprint(objective) {
   return createHash('sha256')
@@ -92,19 +107,22 @@ export class ToolCallHandler {
     getFrontend,
     getTurnId,
     getTurnGeneration,
-    coordinator,
+    backendRuntime,
     backendAvailability = null,
     memoryService,
     notesStore,
     getClientContext = () => ({}),
-    getConversationContext = () => [],
     onMemoryChanged = () => {},
-    respondPermission,
+    respondAuthorization,
     permissionPolicy,
     onPermissionDeliveryFailed = () => {},
     requestClientState = () => {},
     onAgentActivity = () => {},
     inputAssets = null,
+    frontendRetrieval = null,
+    frontendKnowledge = null,
+    frontendToolSources = [],
+    turnCitations = null,
   }) {
     this.taskManager = taskManager
     this.ownerId = ownerId
@@ -113,19 +131,57 @@ export class ToolCallHandler {
     this.getFrontend = getFrontend
     this.getTurnId = getTurnId
     this.getTurnGeneration = getTurnGeneration
-    this.coordinator = coordinator
+    this.backendRuntime = backendRuntime
     this.backendAvailability = backendAvailability
     this.memoryService = memoryService
     this.notesStore = notesStore
     this.getClientContext = getClientContext
-    this.getConversationContext = getConversationContext
     this.onMemoryChanged = onMemoryChanged
-    this.respondPermission = respondPermission
+    this.respondAuthorization = respondAuthorization
     this.permissionPolicy = permissionPolicy
     this.onPermissionDeliveryFailed = onPermissionDeliveryFailed
     this.requestClientState = requestClientState
     this.onAgentActivity = onAgentActivity
     this.inputAssets = inputAssets
+    this.frontendRetrieval = frontendRetrieval
+    this.frontendKnowledge = frontendKnowledge
+    this.frontendToolSources = frontendToolSources
+    this.turnCitations = turnCitations
+    this.activeToolEntries = new Map()
+    this.externalToolLoop = new FrontendToolLoop()
+    this.toolExecutor = frontendToolRegistry.createExecutor({
+      [SPAWN_THINKING_TOOL_NAME]: context => (
+        this.executeSpawnThinkingToolCall(context)
+      ),
+      [SCHEDULE_REMINDER_TOOL_NAME]: ({ callId, turnId, args }) => (
+        this.handleScheduleReminder(callId, turnId, args)
+      ),
+      [CANCEL_AGENT_TASK_TOOL_NAME]: context => (
+        this.executeCancelToolCall(context)
+      ),
+      [GET_AGENT_TASK_STATUS_TOOL_NAME]: context => (
+        this.executeStatusToolCall(context)
+      ),
+      [GET_CURRENT_TIME_TOOL_NAME]: ({ callId, turnId }) => (
+        this.getCurrentTime(callId, turnId)
+      ),
+      [MEMORY_TOOL_NAME]: context => this.executeMemoryToolCall(context),
+      [NOTES_TOOL_NAME]: ({ callId, turnId, args }) => (
+        this.notes(callId, turnId, args)
+      ),
+      [RESPOND_AGENT_PERMISSION_TOOL_NAME]: context => (
+        this.respondAgentPermission(context)
+      ),
+      [RESPOND_FRONTEND_TOOL_PERMISSION_NAME]: ({ callId, turnId, args }) => (
+        this.respondFrontendToolPermission(callId, turnId, args)
+      ),
+      [ENTER_SLEEP_TOOL_NAME]: ({ callId, turnId }) => (
+        this.enterSleep(callId, turnId)
+      ),
+      [WEB_SEARCH_TOOL_NAME]: context => this.webSearch(context),
+      [FETCH_URL_TOOL_NAME]: context => this.fetchUrl(context),
+      [KNOWLEDGE_TOOL_NAME]: context => this.knowledge(context),
+    })
     this.gatewayApprovedPermissions = new Set()
     this.processedCalls = new Set()
     this.spawnResponseByTurn = new Map()
@@ -133,6 +189,152 @@ export class ToolCallHandler {
     this.cancelResponseByTurn = new Map()
     this.terminalToolResponses = new Set()
     this.deferredToolResponses = new Map()
+    this.pendingBackendPermissions = new Map()
+    this.submittedBackendPermissions = new Set()
+    this.pendingExternalAuthorizations = new Map()
+  }
+
+  externalTool(name) {
+    return findFrontendSourceTool(this.frontendToolSources, name)
+  }
+
+  async executeExternalSource(external, args) {
+    const { source, tool } = external
+    let output
+    try {
+      output = await source.execute(tool.name, args)
+    } catch {
+      output = failure(
+        'external_tool_unavailable',
+        '外部工具暂时不可用。',
+        { retryable: true },
+      )
+    }
+    const bounded = boundFrontendToolResult(
+      output,
+      tool.policy?.maxResultBytes,
+    )
+    return bounded.accepted
+      ? bounded.value
+      : failure(
+          'tool_result_too_large',
+          '工具结果过大，无法在当前语音轮次中安全返回。',
+          { retryable: true },
+        )
+  }
+
+  async requestExternalToolApproval(external, context) {
+    if (
+      this.pendingExternalAuthorizations.size
+      >= MAX_PENDING_EXTERNAL_AUTHORIZATIONS
+    ) {
+      await this.sendOutput(
+        context.callId,
+        failure(
+          'external_authorization_limit',
+          '当前等待确认的外部操作过多，请先处理已有请求。',
+          { retryable: true },
+        ),
+        context.turnId,
+      )
+      return { handled: true, executed: false }
+    }
+    const authorizationId = `frontend_auth_${randomUUID()}`
+    const description = String(
+      external.tool.definition?.function?.description || external.tool.name,
+    ).replace(/\s+/gu, ' ').trim().slice(0, 400)
+    this.pendingExternalAuthorizations.set(authorizationId, {
+      ...external,
+      args: context.args,
+      operation: description,
+    })
+    await this.sendOutput(context.callId, {
+      status: 'confirmation_required',
+      authorization_id: authorizationId,
+      operation: description,
+      message: '此操作会修改外部系统，必须先获得用户明确同意。',
+    }, context.turnId, null, {
+      response: {
+        instructions: [
+          '这是前台外部工具执行前的确认请求。',
+          '自然、简短地说明 operation 并询问用户是否允许，不要声称已经执行。',
+          '用户回答后按语义调用 respond_frontend_tool_permission；不要要求固定口令，也不要朗读 authorization_id。',
+        ].join(' '),
+      },
+    })
+    return { handled: true, executed: false, authorizationId }
+  }
+
+  async executeExternalToolCall(external, context) {
+    const { tool } = external
+    const directlyExecutable = tool.policy?.readOnly === true
+    const requiresApproval = (
+      tool.policy?.readOnly === false
+      && tool.policy?.approval === 'required'
+    )
+    if (!directlyExecutable && !requiresApproval) {
+      await this.sendOutput(
+        context.callId,
+        failure('tool_unavailable', '当前前台没有启用这个能力。'),
+        context.turnId,
+      )
+      return { handled: true, executed: false }
+    }
+    const limit = this.externalToolLoop.admit({ ...context, tool })
+    if (!limit.admitted) {
+      await this.sendOutput(
+        context.callId,
+        limit.reason === 'repeated_call'
+          ? {
+              status: 'duplicate',
+              message: '本轮相同操作已经处理，不再重复执行。',
+            }
+          : failure(
+              'tool_loop_limit',
+              '本轮工具调用已达到安全边界，已停止继续执行。',
+              { retryable: true },
+            ),
+        context.turnId,
+      )
+      return { handled: true, executed: false, limit }
+    }
+    if (requiresApproval) {
+      return this.requestExternalToolApproval(external, context)
+    }
+    const output = await this.executeExternalSource(external, context.args)
+    await this.sendOutput(context.callId, output, context.turnId)
+    return { handled: true, executed: true, value: output }
+  }
+
+  async respondFrontendToolPermission(callId, turnId, args = {}) {
+    const authorizationId = String(args.authorization_id || '').trim()
+    const decision = String(args.decision || '').trim()
+    const pending = this.pendingExternalAuthorizations.get(authorizationId)
+    if (!pending || !['allow', 'reject'].includes(decision)) {
+      await this.sendOutput(
+        callId,
+        failure(
+          'external_authorization_not_pending',
+          '没有找到仍在等待决定的外部工具请求。',
+        ),
+        turnId,
+      )
+      return
+    }
+    this.pendingExternalAuthorizations.delete(authorizationId)
+    if (decision === 'reject') {
+      await this.sendOutput(callId, {
+        status: 'rejected',
+        message: '用户拒绝了这次外部工具操作。',
+      }, turnId, null, {
+        response: {
+          instructions: '自然、简短地确认本次操作未执行，不要调用工具。',
+        },
+      })
+      return
+    }
+    const output = await this.executeExternalSource(pending, pending.args)
+    await this.sendOutput(callId, output, turnId)
   }
 
   markTerminalToolResponse(responseId) {
@@ -163,12 +365,27 @@ export class ToolCallHandler {
       responseContext,
       ...frontendOptions
     } = options || {}
+    const tool = this.activeToolEntries.get(callId)
+    const bounded = boundFrontendToolResult(
+      output,
+      tool?.policy.maxResultBytes,
+    )
+    const safeOutput = bounded.accepted
+      ? bounded.value
+      : failure(
+          'tool_result_too_large',
+          '工具结果过大，无法在当前语音轮次中安全返回。',
+          { retryable: true },
+        )
+    const projectedOutput = this.turnCitations?.project(turnId, safeOutput)
+      || safeOutput
     await this.getFrontend()?.sendFunctionOutput(
       callId,
-      output,
+      projectedOutput,
       { turnId, taskId, ...(responseContext || {}) },
       frontendOptions,
     )
+    return projectedOutput
   }
 
   beginDeferredToolResponse(responseId, {
@@ -247,29 +464,46 @@ export class ToolCallHandler {
     )
   }
 
-  forwardCoordinatorEvent(event, onEvent) {
+  forwardBackendEvent(taskId, event, onEvent) {
     const permission = event?.permission
     if (
-      event?.type === 'backend.permission.resolved'
+      event?.type === BackendEventType.AUTHORIZATION_RESOLVED
+      && permission?.id
+    ) {
+      this.pendingBackendPermissions.delete(permission.id)
+      this.submittedBackendPermissions.delete(permission.id)
+    }
+    if (
+      event?.type === BackendEventType.AUTHORIZATION_RESOLVED
       && permission?.id
       && this.gatewayApprovedPermissions.delete(permission.id)
     ) return
     if (
-      event?.type !== 'backend.permission.requested'
+      event?.type !== BackendEventType.AUTHORIZATION_REQUESTED
       || !permission?.id
-      || !this.respondPermission
+      || !this.respondAuthorization
       || !this.permissionPolicy?.shouldAutoAllow(
         this.ownerId,
         this.sessionId,
       )
     ) {
+      if (
+        event?.type === BackendEventType.AUTHORIZATION_REQUESTED
+        && permission?.id
+      ) {
+        this.pendingBackendPermissions.set(permission.id, {
+          taskId,
+          permission,
+        })
+      }
       onEvent(event)
       return
     }
     this.gatewayApprovedPermissions.add(permission.id)
     let approval
     try {
-      approval = this.respondPermission(
+      approval = this.respondAuthorization(
+        taskId,
         permission.id,
         'always',
         { ownerId: this.ownerId },
@@ -291,45 +525,42 @@ export class ToolCallHandler {
   createWork({
     turnId,
     objective,
-    verbatimRequest,
     submissionKey,
     inputParts = [],
   }) {
-    let workId = ''
-    let requestId = ''
+    let taskId = ''
     const task = this.taskManager.create({
       objective,
       ownerId: this.ownerId,
       sessionId: this.sessionId,
       turnId,
       submissionKey,
-      laneKey: `coordinator:${this.ownerId}`,
+      laneKey: `backend:${this.ownerId}`,
       laneLimit: 1,
       runner: async (_ignored, { onEvent, signal }) => {
-        // The verbatim request was pinned at acceptance and is almost
-        // certainly settled by now; awaiting it never blocks the receipt.
-        const resolved = (await verbatimRequest) || {}
-        return this.coordinator.run({
-          originalRequest: resolved.originalRequest || objective,
-          objective,
-          conversationContext: this.getConversationContext(),
-          userMemories: this.memoryService?.list(this.ownerId, { limit: 64 }) || [],
-          timeZone: this.getClientContext()?.timeZone,
-          workingDirectory: this.getClientContext()?.workingDirectory,
-          inputParts: mergeInputParts(inputParts, resolved.inputParts || []),
-        }, {
-          ownerId: this.ownerId,
-          sessionId: this.sessionId,
-          turnId,
-          coordinationRunId: workId,
-          coordinationRequestId: requestId,
-          signal,
-          onEvent: event => this.forwardCoordinatorEvent(event, onEvent),
-        })
+        try {
+          return await this.backendRuntime.run({
+            objective,
+            inputParts,
+          }, {
+            ownerId: this.ownerId,
+            sessionId: this.sessionId,
+            turnId,
+            taskId,
+            signal,
+            onEvent: event => this.forwardBackendEvent(taskId, event, onEvent),
+          })
+        } finally {
+          for (const [id, entry] of this.pendingBackendPermissions) {
+            if (entry.taskId !== taskId) continue
+            this.pendingBackendPermissions.delete(id)
+            this.submittedBackendPermissions.delete(id)
+          }
+        }
       },
       canceler: async ({ previousStatus, abort }) => {
-        const result = await this.coordinator.cancelWork(
-          workId,
+        const result = await this.backendRuntime.cancel(
+          taskId,
           { ownerId: this.ownerId },
         )
         abort()
@@ -337,12 +568,11 @@ export class ToolCallHandler {
           ...result,
           layer: previousStatus === 'finalizing'
             ? 'finalizing'
-            : result?.layer || 'coordinator',
+            : result?.layer || 'backend',
         }
       },
     })
-    workId = task.id
-    requestId = task.jobId
+    taskId = task.id
     return task
   }
 
@@ -361,28 +591,17 @@ export class ToolCallHandler {
     const type = args.type === 'task' ? 'task' : 'reminder'
     const recurrence = args.recurrence || 'once'
 
-    // For type='task', build a coordinator runner that will execute the
-    // objective when the scheduled task fires. The coordinator singleton
-    // and ownerId are safe to capture — they outlive the voice session.
-    const coordinator = this.coordinator
-    const memoryService = this.memoryService
+    // Scheduled work resolves through the same single-backend runtime as a
+    // live request. The runtime and owner identity outlive the voice session.
+    const backendRuntime = this.backendRuntime
     const runner = type === 'task'
-      ? async (objective, context) => coordinator.run({
-          originalRequest: objective,
+      ? async (objective, context) => backendRuntime.run({
           objective,
-          conversationContext: [],
-          // Resolve at execution time so a future task sees the user's latest
-          // model and long-term memory, not a snapshot from when it was set.
-          userMemories: memoryService?.list(
-            context.ownerId,
-            { limit: 64 },
-          ) || [],
         }, {
           ownerId: context.ownerId,
           sessionId: context.sessionId,
           turnId: context.turnId,
-          coordinationRunId: context.taskId,
-          coordinationRequestId: context.jobId,
+          taskId: context.taskId,
           signal: context.signal,
           onEvent: context.onEvent,
         })
@@ -400,7 +619,7 @@ export class ToolCallHandler {
 
     await this.sendOutput(callId, {
       status: 'scheduled',
-      job_id: task.jobId,
+      task_id: task.id,
       execute_at: args.execute_at,
       type,
       recurrence,
@@ -414,166 +633,135 @@ export class ToolCallHandler {
     })
   }
 
-  async handle(event, callContext = {}) {
-    const callId = event.call_id || event.item?.call_id || ''
-    const toolName = event.name || event.item?.name || ''
-    if (!callId) throw new Error('Realtime 工具调用缺少 call_id')
-    if (this.processedCalls.has(callId)) return
-    this.processedCalls.add(callId)
-    if (this.processedCalls.size > 500) {
-      this.processedCalls.delete(this.processedCalls.values().next().value)
-    }
-
-    const turnId = callContext.turnId
-      || event.__voiceContext?.turnId
-      || this.getTurnId()
-    const generation = Number.isInteger(callContext.turnGeneration)
-      ? callContext.turnGeneration
-      : Number.isInteger(event.__voiceContext?.turnGeneration)
-        ? event.__voiceContext.turnGeneration
-        : this.getTurnGeneration()
-    let args = {}
+  async executeMemoryToolCall({
+    callId,
+    turnId,
+    generation,
+    args,
+    event,
+    callContext,
+  }) {
+    const responseId = callContext.responseId || event.response_id || ''
+    const deferred = this.beginDeferredToolResponse(responseId, {
+      turnId,
+      turnGeneration: generation,
+    })
     try {
-      args = JSON.parse(event.arguments || '{}')
-    } catch {
-      // Invalid arguments are handled as missing fields below.
+      await this.memory(callId, turnId, args, deferred
+        ? { createResponse: false }
+        : undefined)
+    } catch (error) {
+      await this.completeDeferredToolResponse(deferred, { failed: true })
+      throw error
     }
+    await this.completeDeferredToolResponse(deferred)
+  }
 
-    if (this.isStale(turnId, generation)) {
-      await this.closeStaleCall(callId, turnId)
+  async executeCancelToolCall({
+    callId,
+    turnId,
+    generation,
+    args,
+    event,
+    callContext,
+  }) {
+    const responseId = String(
+      callContext.responseId || event.response_id || '',
+    ).trim()
+    const firstCancelResponse = turnId
+      ? this.cancelResponseByTurn.get(turnId)
+      : null
+    if (responseId && firstCancelResponse
+      && firstCancelResponse !== responseId) {
+      this.markTerminalToolResponse(responseId)
+      await this.sendOutput(callId, {
+        status: 'duplicate',
+        message: '本轮取消操作已经处理，不再重复执行。',
+      }, turnId, null, { createResponse: false })
       return
     }
-
-    if (toolName === GET_CURRENT_TIME_TOOL_NAME) {
-      await this.getCurrentTime(callId, turnId)
-      return
-    }
-    if (toolName === MEMORY_TOOL_NAME) {
-      const responseId = callContext.responseId || event.response_id || ''
-      const deferred = this.beginDeferredToolResponse(responseId, {
-        turnId,
-        turnGeneration: generation,
-      })
-      try {
-        await this.memory(callId, turnId, args, deferred
-          ? { createResponse: false }
-          : undefined)
-      } catch (error) {
-        await this.completeDeferredToolResponse(deferred, { failed: true })
-        throw error
-      }
-      await this.completeDeferredToolResponse(deferred)
-      return
-    }
-    if (toolName === NOTES_TOOL_NAME) {
-      await this.notes(callId, turnId, args)
-      return
-    }
-    if (toolName === SCHEDULE_REMINDER_TOOL_NAME) {
-      await this.handleScheduleReminder(callId, turnId, args)
-      return
-    }
-    if (toolName === CANCEL_AGENT_TASK_TOOL_NAME) {
-      const responseId = String(
-        callContext.responseId || event.response_id || '',
-      ).trim()
-      const firstCancelResponse = turnId
-        ? this.cancelResponseByTurn.get(turnId)
-        : null
-      if (responseId && firstCancelResponse
-        && firstCancelResponse !== responseId) {
-        this.markTerminalToolResponse(responseId)
-        await this.sendOutput(callId, {
-          status: 'duplicate',
-          message: '本轮取消操作已经处理，不再重复执行。',
-        }, turnId, null, { createResponse: false })
-        return
-      }
-      if (responseId && turnId && !firstCancelResponse) {
-        this.cancelResponseByTurn.set(turnId, responseId)
-        if (this.cancelResponseByTurn.size > 100) {
-          this.cancelResponseByTurn.delete(
-            this.cancelResponseByTurn.keys().next().value,
-          )
-        }
-      }
-      const deferred = this.beginDeferredToolResponse(responseId, {
-        turnId,
-        turnGeneration: generation,
-      }, { instructions: CANCEL_RECEIPT_INSTRUCTIONS })
-      let outputFailed = false
-      try {
-        await this.cancelAgentTask(
-          callId,
-          turnId,
-          args,
-          deferred
-            ? { createResponse: false }
-            : { response: { instructions: CANCEL_RECEIPT_INSTRUCTIONS } },
+    if (responseId && turnId && !firstCancelResponse) {
+      this.cancelResponseByTurn.set(turnId, responseId)
+      if (this.cancelResponseByTurn.size > 100) {
+        this.cancelResponseByTurn.delete(
+          this.cancelResponseByTurn.keys().next().value,
         )
-      } catch (error) {
-        outputFailed = true
-        throw error
-      } finally {
-        await this.completeDeferredToolResponse(deferred, {
-          failed: outputFailed,
-        })
       }
-      return
     }
-    if (toolName === GET_AGENT_TASK_STATUS_TOOL_NAME) {
-      const responseId = String(
-        callContext.responseId || event.response_id || '',
-      ).trim()
-      const spawnResponse = turnId
-        ? this.spawnResponseByTurn.get(turnId)
-        : null
-      const firstStatusResponse = turnId
-        ? this.statusResponseByTurn.get(turnId)
-        : null
-      const followsSpawnReceipt = Boolean(
-        responseId && spawnResponse && responseId !== spawnResponse,
-      )
-      const repeatsStatusQuery = Boolean(
-        responseId && firstStatusResponse && responseId !== firstStatusResponse,
-      )
-      if (followsSpawnReceipt || repeatsStatusQuery) {
-        this.markTerminalToolResponse(responseId)
-        await this.sendOutput(callId, {
-          status: 'duplicate',
-          message: '本轮不需要再次查询工作状态。',
-        }, turnId, null, { createResponse: false })
-        return
-      }
-      if (responseId && turnId && !firstStatusResponse) {
-        this.statusResponseByTurn.set(turnId, responseId)
-        if (this.statusResponseByTurn.size > 100) {
-          this.statusResponseByTurn.delete(
-            this.statusResponseByTurn.keys().next().value,
-          )
-        }
-      }
-      this.onAgentActivity({ activity: 'query', turnId })
-      await this.getAgentTaskStatus(callId, turnId, args)
-      return
-    }
-    if (toolName === RESPOND_AGENT_PERMISSION_TOOL_NAME) {
-      await this.respondAgentPermission(callId, turnId, args)
-      return
-    }
-    if (toolName === ENTER_SLEEP_TOOL_NAME) {
-      await this.enterSleep(callId, turnId)
-      return
-    }
-    if (toolName !== SPAWN_THINKING_TOOL_NAME) {
-      await this.sendOutput(
+    const deferred = this.beginDeferredToolResponse(responseId, {
+      turnId,
+      turnGeneration: generation,
+    }, { instructions: CANCEL_RECEIPT_INSTRUCTIONS })
+    let outputFailed = false
+    try {
+      await this.cancelAgentTask(
         callId,
-        failure('unsupported_tool', '当前无法执行这个操作。'),
         turnId,
+        args,
+        deferred
+          ? { createResponse: false }
+          : { response: { instructions: CANCEL_RECEIPT_INSTRUCTIONS } },
       )
+    } catch (error) {
+      outputFailed = true
+      throw error
+    } finally {
+      await this.completeDeferredToolResponse(deferred, {
+        failed: outputFailed,
+      })
+    }
+  }
+
+  async executeStatusToolCall({
+    callId,
+    turnId,
+    args,
+    event,
+    callContext,
+  }) {
+    const responseId = String(
+      callContext.responseId || event.response_id || '',
+    ).trim()
+    const spawnResponse = turnId
+      ? this.spawnResponseByTurn.get(turnId)
+      : null
+    const firstStatusResponse = turnId
+      ? this.statusResponseByTurn.get(turnId)
+      : null
+    const followsSpawnReceipt = Boolean(
+      responseId && spawnResponse && responseId !== spawnResponse,
+    )
+    const repeatsStatusQuery = Boolean(
+      responseId && firstStatusResponse && responseId !== firstStatusResponse,
+    )
+    if (followsSpawnReceipt || repeatsStatusQuery) {
+      this.markTerminalToolResponse(responseId)
+      await this.sendOutput(callId, {
+        status: 'duplicate',
+        message: '本轮不需要再次查询工作状态。',
+      }, turnId, null, { createResponse: false })
       return
     }
+    if (responseId && turnId && !firstStatusResponse) {
+      this.statusResponseByTurn.set(turnId, responseId)
+      if (this.statusResponseByTurn.size > 100) {
+        this.statusResponseByTurn.delete(
+          this.statusResponseByTurn.keys().next().value,
+        )
+      }
+    }
+    this.onAgentActivity({ activity: 'query', turnId })
+    await this.getAgentTaskStatus(callId, turnId, args)
+  }
 
+  async executeSpawnThinkingToolCall({
+    callId,
+    turnId,
+    generation,
+    args,
+    event,
+    callContext,
+  }) {
     const pendingPermissionTask = this.taskManager.list({
       ownerId: this.ownerId,
       sessionId: this.sessionId,
@@ -696,7 +884,7 @@ export class ToolCallHandler {
       }).find(item => item.turnId === turnId)
       await this.sendOutput(callId, {
         status: 'duplicate',
-        ...(existing?.jobId ? { job_id: existing.jobId } : {}),
+        ...(existing?.id ? { task_id: existing.id } : {}),
         message: '本轮工作已经提交，不再从工具回执继续创建任务。',
       }, turnId, existing?.id, { createResponse: false })
       return
@@ -727,19 +915,9 @@ export class ToolCallHandler {
         turnId || callId,
         objectiveFingerprint(objective),
       ].join(':')
-      // Pin the verbatim user request without blocking the receipt: the
-      // transcript waiter registers now, so the ASR result is captured even
-      // if the per-connection ring buffer evicts that turn before the FIFO
-      // lane dispatches this work. resolveDelegation never rejects and a
-      // closed session resolves to the model-provided objective.
-      const verbatimRequest = this.transcripts.resolveDelegation(
-        turnId,
-        objective,
-      )
       task = this.createWork({
         turnId,
         objective,
-        verbatimRequest,
         submissionKey,
         inputParts: delegatedInputParts,
       })
@@ -779,12 +957,12 @@ export class ToolCallHandler {
         task.reused
           ? {
               status: 'duplicate',
-              job_id: task.jobId,
+              task_id: task.id,
               message: '同一工作此前已受理，请自然确认一次，不要再次调用工具。',
             }
           : {
               status: 'accepted',
-              job_id: task.jobId,
+              task_id: task.id,
               message: '工作已受理，请自然确认一次，不要再次调用工具。',
             },
         turnId,
@@ -800,6 +978,107 @@ export class ToolCallHandler {
       await this.completeDeferredToolResponse(deferred, {
         failed: outputFailed,
       })
+    }
+  }
+
+  async handle(event, callContext = {}) {
+    const callId = event.call_id || event.item?.call_id || ''
+    const toolName = event.name || event.item?.name || ''
+    if (!callId) throw new Error('Realtime 工具调用缺少 call_id')
+    if (this.processedCalls.has(callId)) return
+    this.processedCalls.add(callId)
+    if (this.processedCalls.size > 500) {
+      this.processedCalls.delete(this.processedCalls.values().next().value)
+    }
+
+    const turnId = callContext.turnId
+      || event.__voiceContext?.turnId
+      || this.getTurnId()
+    const generation = Number.isInteger(callContext.turnGeneration)
+      ? callContext.turnGeneration
+      : Number.isInteger(event.__voiceContext?.turnGeneration)
+        ? event.__voiceContext.turnGeneration
+        : this.getTurnGeneration()
+    let args = {}
+    try {
+      args = JSON.parse(event.arguments || '{}')
+    } catch {
+      // Invalid arguments are handled as missing fields below.
+    }
+
+    if (this.isStale(turnId, generation)) {
+      await this.closeStaleCall(callId, turnId)
+      return
+    }
+
+    const external = this.externalTool(toolName)
+    const tool = frontendToolRegistry.get(toolName) || external?.tool
+    if (tool) this.activeToolEntries.set(callId, tool)
+    try {
+      if (external) {
+        return await this.executeExternalToolCall(external, {
+          callId,
+          turnId,
+          turnGeneration: generation,
+          args,
+          event,
+          callContext,
+        })
+      }
+      const execution = await this.toolExecutor.execute(toolName, {
+        callId,
+        turnId,
+        generation,
+        args,
+        event,
+        callContext,
+        frontend: {
+          capabilities: [...new Set([
+            ...(this.frontendRetrieval?.capabilities?.() || []),
+            ...(this.frontendKnowledge?.capabilities?.() || []),
+            ...frontendSourceToolCapabilities(this.frontendToolSources),
+          ])],
+        },
+      })
+      if (execution.handled && !execution.executed) {
+        const responseId = String(
+          callContext.responseId || event.response_id || '',
+        ).trim()
+        this.markTerminalToolResponse(responseId)
+        await this.sendOutput(
+          callId,
+          execution.limit.reason === 'tool_unavailable'
+            ? failure(
+                'tool_unavailable',
+                '当前前台没有启用这个能力。',
+                { retryable: false },
+              )
+            : execution.limit.reason === 'repeated_call'
+            ? {
+                status: 'duplicate',
+                message: '本轮相同操作已经处理，不再重复执行。',
+              }
+            : failure(
+                'tool_loop_limit',
+                '本轮工具调用已达到安全边界，已停止继续执行。',
+                { retryable: true },
+              ),
+          turnId,
+          null,
+          { createResponse: execution.limit.reason === 'tool_unavailable' },
+        )
+        return execution
+      }
+      if (!execution.handled) {
+        await this.sendOutput(
+          callId,
+          failure('unsupported_tool', '当前无法执行这个操作。'),
+          turnId,
+        )
+      }
+      return execution
+    } finally {
+      this.activeToolEntries.delete(callId)
     }
   }
 
@@ -823,6 +1102,100 @@ export class ToolCallHandler {
     this.requestClientState('sleeping')
   }
 
+  async webSearch({ callId, turnId, args }) {
+    const query = String(args.query || '').trim()
+    if (!query) {
+      await this.sendOutput(
+        callId,
+        failure('missing_query', '需要提供要搜索的内容。'),
+        turnId,
+      )
+      return
+    }
+    try {
+      const result = await this.frontendRetrieval.search(query, {
+        limit: args.limit,
+      })
+      await this.sendOutput(callId, result, turnId)
+    } catch (error) {
+      await this.sendOutput(
+        callId,
+        failure(
+          error.code || 'web_search_failed',
+          '网页搜索暂时不可用，请稍后再试。',
+          { retryable: true },
+        ),
+        turnId,
+      )
+    }
+  }
+
+  async fetchUrl({ callId, turnId, args }) {
+    const url = String(args.url || '').trim()
+    if (!url) {
+      await this.sendOutput(
+        callId,
+        failure('missing_url', '需要提供要读取的网址。'),
+        turnId,
+      )
+      return
+    }
+    try {
+      const result = await this.frontendRetrieval.fetchUrl(url)
+      await this.sendOutput(callId, result, turnId)
+    } catch (error) {
+      const safeMessage = error.name === 'UrlFetchError'
+        ? error.message
+        : '网页暂时无法读取，请稍后再试。'
+      await this.sendOutput(
+        callId,
+        failure(
+          error.code || 'url_fetch_failed',
+          safeMessage,
+          { retryable: error.code !== 'private_network_forbidden' },
+        ),
+        turnId,
+      )
+    }
+  }
+
+  async knowledge({ callId, turnId, args }) {
+    if (!this.frontendKnowledge) {
+      await this.sendOutput(
+        callId,
+        failure('knowledge_unavailable', '前台知识库当前不可用。'),
+        turnId,
+      )
+      return
+    }
+    try {
+      const query = String(args.query || '').trim()
+      const output = query
+        ? await this.frontendKnowledge.search(query, {
+            ownerId: this.ownerId,
+            sessionId: this.sessionId,
+            turnId,
+            traceId: callId,
+            knowledgeBaseIds: Array.isArray(args.knowledge_base_ids)
+              ? args.knowledge_base_ids
+              : [],
+            topK: args.top_k,
+          })
+        : failure('missing_knowledge_query', '需要提供要检索的内容。')
+      await this.sendOutput(callId, output, turnId)
+    } catch (error) {
+      await this.sendOutput(
+        callId,
+        failure(
+          error?.code || 'knowledge_operation_failed',
+          '暂时无法完成知识检索，请稍后重试。',
+          { retryable: true },
+        ),
+        turnId,
+      )
+    }
+  }
+
   notifyMemoryChanged() {
     try {
       this.onMemoryChanged()
@@ -831,69 +1204,144 @@ export class ToolCallHandler {
     }
   }
 
-  async respondAgentPermission(callId, turnId, args) {
+  async respondAgentPermission({
+    callId,
+    turnId,
+    generation,
+    args,
+    callContext,
+  }) {
     const authorizationId = String(args.authorization_id || '').trim()
     const decision = String(args.decision || '').trim()
-    const transcript = String(await this.transcripts.transcript(turnId)).trim()
-    if (
-      !authorizationId
-      || !['always', 'reject'].includes(decision)
-      || !transcript
-    ) {
-      await this.sendOutput(
-        callId,
-        failure('invalid_permission_response', '没有找到有效的权限请求或决定。'),
-        turnId,
+    const responseId = String(
+      callContext?.responseId || callContext?.event?.response_id || '',
+    ).trim()
+    const response = ['always', 'reject'].includes(decision)
+      ? {
+          instructions: decision === 'always'
+            ? [
+                '权限决定已提交，并在本会话立即生效。',
+                '只用一句简短自然口语确认“已允许，后台继续执行”。',
+                '不要重述操作，不要再次询问或调用工具。',
+              ].join(' ')
+            : [
+                '权限决定已提交。',
+                '只用一句简短自然口语确认“已拒绝，后台不会执行这项操作”。',
+                '不要重述操作，不要再次询问或调用工具。',
+              ].join(' '),
+        }
+      : null
+    const deferred = this.beginDeferredToolResponse(responseId, {
+      turnId,
+      turnGeneration: generation,
+    }, response)
+    const outputOptions = deferred
+      ? { createResponse: false }
+      : { response }
+    let failed = false
+    try {
+      const transcript = String(await this.transcripts.transcript(turnId)).trim()
+      if (!authorizationId || !response || !transcript) {
+        await this.sendOutput(
+          callId,
+          failure('invalid_permission_response', '没有找到有效的权限请求或决定。'),
+          turnId,
+          null,
+          deferred ? { createResponse: false } : undefined,
+        )
+        return
+      }
+      const trackedPermission = this.pendingBackendPermissions.get(authorizationId)
+      const pendingTask = trackedPermission
+        ? this.taskManager.getByTaskId(trackedPermission.taskId, {
+            ownerId: this.ownerId,
+          })
+        : this.taskManager.list({
+            ownerId: this.ownerId,
+            sessionId: this.sessionId,
+            active: true,
+          }).find(task => task.authorization?.id === authorizationId)
+      if (!pendingTask) {
+        await this.sendOutput(
+          callId,
+          failure(
+            'permission_not_pending',
+            '这项权限请求已经处理过或不属于当前任务；若用户刚在界面上确认过，'
+            + '无需重复回应，直接继续即可。',
+            { retryable: false },
+          ),
+          turnId,
+          null,
+          deferred ? { createResponse: false } : undefined,
+        )
+        return
+      }
+      if (!this.respondAuthorization) {
+        await this.sendOutput(
+          callId,
+          failure('permission_unavailable', '当前后台无法接收权限决定。'),
+          turnId,
+          null,
+          deferred ? { createResponse: false } : undefined,
+        )
+        return
+      }
+      if (this.submittedBackendPermissions.has(authorizationId)) {
+        await this.sendOutput(callId, {
+          status: 'already_submitted',
+          authorization_id: authorizationId,
+        }, turnId, pendingTask.id, deferred ? { createResponse: false } : undefined)
+        return
+      }
+      const previousPermissionMode = this.permissionPolicy?.mode(
+        this.ownerId,
+        this.sessionId,
       )
-      return
-    }
-    const pendingTask = this.taskManager.list({
-      ownerId: this.ownerId,
-      sessionId: this.sessionId,
-      active: true,
-    }).find(task => task.authorization?.id === authorizationId)
-    if (!pendingTask) {
-      await this.sendOutput(
-        callId,
-        failure(
-          'permission_not_pending',
-          '这项权限请求已经处理过或不属于当前任务；若用户刚在界面上确认过，'
-          + '无需重复回应，直接继续即可。',
-          { retryable: false },
-        ),
-        turnId,
-      )
-      return
-    }
-    if (!this.respondPermission) {
-      await this.sendOutput(
-        callId,
-        failure('permission_unavailable', '当前后台无法接收权限决定。'),
-        turnId,
-      )
-      return
-    }
-    const previousPermissionMode = this.permissionPolicy?.mode(
-      this.ownerId,
-      this.sessionId,
-    )
-    this.permissionPolicy?.applyDecision(
-      this.ownerId,
-      this.sessionId,
-      decision,
-    )
-    // Receipt-based: the local policy takes effect immediately and the ACP
-    // round trip must not delay the spoken confirmation. On delivery failure
-    // the policy rolls back and the authorization is still pending on the
-    // backend, so the gateway can re-announce it through the existing
-    // pending-permission retry path.
-    Promise.resolve()
-      .then(() => this.respondPermission(
-        authorizationId,
+      this.permissionPolicy?.applyDecision(
+        this.ownerId,
+        this.sessionId,
         decision,
-        { ownerId: this.ownerId },
-      ))
-      .catch(error => {
+      )
+      // Receipt-based: the local policy takes effect immediately and the backend
+      // round trip must not delay the spoken confirmation. An "always" decision
+      // also settles permissions that arrived concurrently for this same task.
+      const permissions = decision === 'always'
+        ? [...this.pendingBackendPermissions.entries()]
+            .filter(([id, entry]) => (
+              entry.taskId === pendingTask.id
+              && !this.submittedBackendPermissions.has(id)
+            ))
+            .map(([id, entry]) => ({ id, taskId: entry.taskId }))
+        : [{ id: authorizationId, taskId: pendingTask.id }]
+      if (!permissions.some(permission => permission.id === authorizationId)) {
+        permissions.push({ id: authorizationId, taskId: pendingTask.id })
+      }
+      permissions.forEach(permission => {
+        this.submittedBackendPermissions.add(permission.id)
+      })
+      Promise.all(permissions.map(async permission => {
+        try {
+          await this.respondAuthorization(
+            permission.taskId,
+            permission.id,
+            decision,
+            { ownerId: this.ownerId },
+          )
+        } catch (error) {
+          this.submittedBackendPermissions.delete(permission.id)
+          try {
+            this.onPermissionDeliveryFailed({
+              authorizationId: permission.id,
+              decision,
+              taskId: permission.taskId,
+              error: String(error?.message || error),
+            })
+          } catch {
+            // Delivery diagnostics must not break the voice session.
+          }
+          throw error
+        }
+      })).catch(() => {
         if (previousPermissionMode) {
           this.permissionPolicy?.setMode(
             this.ownerId,
@@ -901,35 +1349,17 @@ export class ToolCallHandler {
             previousPermissionMode,
           )
         }
-        try {
-          this.onPermissionDeliveryFailed({
-            authorizationId,
-            decision,
-            taskId: pendingTask.id,
-            error: String(error?.message || error),
-          })
-        } catch {
-          // Delivery diagnostics must not break the voice session.
-        }
       })
-    await this.sendOutput(callId, {
-      status: 'submitted',
-      authorization_id: authorizationId,
-    }, turnId, pendingTask.id, {
-      response: {
-        instructions: decision === 'always'
-          ? [
-              '权限决定已提交，并在本会话立即生效。',
-              '只用一句简短自然口语确认“已允许，后台继续执行”。',
-              '不要重述操作，不要再次询问或调用工具。',
-            ].join(' ')
-          : [
-              '权限决定已提交。',
-              '只用一句简短自然口语确认“已拒绝，后台不会执行这项操作”。',
-              '不要重述操作，不要再次询问或调用工具。',
-            ].join(' '),
-      },
-    })
+      await this.sendOutput(callId, {
+        status: 'submitted',
+        authorization_id: authorizationId,
+      }, turnId, pendingTask.id, outputOptions)
+    } catch (error) {
+      failed = true
+      throw error
+    } finally {
+      await this.completeDeferredToolResponse(deferred, { failed })
+    }
   }
 
   async cancelAgentTask(callId, turnId, args, responseOptions) {
@@ -962,9 +1392,9 @@ export class ToolCallHandler {
       }, turnId, null, responseOptions)
       return
     }
-    const requestedJobId = String(args.job_id || '').trim()
-    const target = requestedJobId
-      ? this.taskManager.getByJobId(requestedJobId, { ownerId: this.ownerId })
+    const requestedTaskId = String(args.task_id || '').trim()
+    const target = requestedTaskId
+      ? this.taskManager.getByTaskId(requestedTaskId, { ownerId: this.ownerId })
       : this.taskManager.list({
           ownerId: this.ownerId,
           sessionId: this.sessionId,
@@ -988,14 +1418,14 @@ export class ToolCallHandler {
     if (!task) {
       await this.sendOutput(callId, {
         status: 'not_active',
-        job_id: target.jobId,
+        task_id: target.id,
         message: '这项工作已经结束，当前无法取消。',
       }, turnId, null, responseOptions)
       return
     }
     await this.sendOutput(callId, task.status === 'cancelled' ? {
       status: task.status,
-      job_id: task.jobId,
+      task_id: task.id,
       message: '已取消这项工作。',
     } : failure(
       'work_cancellation_failed',
@@ -1009,7 +1439,7 @@ export class ToolCallHandler {
         ownerId: this.ownerId,
         sessionId: this.sessionId,
       }).slice(0, 20).map(task => ({
-        job_id: task.jobId,
+        task_id: task.id,
         status: task.status,
         kind: task.kind,
         objective: String(task.objective || '').slice(0, 300),
@@ -1026,13 +1456,13 @@ export class ToolCallHandler {
       }, turnId)
       return
     }
-    const requestedJobId = String(args.job_id || '').trim()
+    const requestedTaskId = String(args.task_id || '').trim()
     const sessionTasks = this.taskManager.list({
       ownerId: this.ownerId,
       sessionId: this.sessionId,
     })
-    const task = requestedJobId
-      ? this.taskManager.getByJobId(requestedJobId, { ownerId: this.ownerId })
+    const task = requestedTaskId
+      ? this.taskManager.getByTaskId(requestedTaskId, { ownerId: this.ownerId })
       : sessionTasks.find(item => [
           'scheduled',
           'queued',
@@ -1053,8 +1483,8 @@ export class ToolCallHandler {
     )
     await this.sendOutput(callId, {
       status: 'ok',
-      job_id: task.jobId,
-      work_status: task.status,
+      task_id: task.id,
+      task_status: task.status,
       objective: task.objective.slice(0, 300),
       elapsed_ms: task.elapsedMs,
       delegation: task.delegation
@@ -1065,6 +1495,14 @@ export class ToolCallHandler {
         : null,
       authorization_pending: task.authorization?.status === 'pending',
       recent_updates: recentTaskUpdates(task.activity),
+      latest_update: task.message
+        ? String(task.message).slice(0, 1_000)
+        : null,
+      artifacts: (task.artifacts || []).slice(-8).map(artifact => ({
+        artifact_id: artifact.artifactId,
+        name: artifact.name || null,
+        description: artifact.description || null,
+      })),
       result: task.status === 'completed'
         ? String(task.result || '').slice(0, 500)
         : null,
@@ -1136,7 +1574,12 @@ export class ToolCallHandler {
           append: action === 'append' ? content : '',
         }
         const changes = [change]
-        const result = this.memoryService.apply(this.ownerId, changes)
+        const result = await this.memoryService.apply(this.ownerId, changes, {
+          source: 'realtime-tool',
+          sessionId: this.sessionId,
+          turnId,
+          traceId: callId,
+        })
         if (result.changed) this.notifyMemoryChanged()
         output = {
           status: result.changed ? 'updated' : 'unchanged',

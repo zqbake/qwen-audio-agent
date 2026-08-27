@@ -57,26 +57,29 @@ export const GatewayServerEvent = Object.freeze({
   TRANSCRIPT_DELTA: 'transcript.delta',
   TRANSCRIPT_FINAL: 'transcript.final',
   TRANSCRIPT_DISCARD: 'transcript.discard',
-  TIMELINE_INLINE: 'timeline.inline',
   AGENT_ACTIVITY: 'agent.activity',
   CLIENT_STATE: 'client.state',
   ERROR: 'error',
 })
 
 export const GatewayTaskEvent = Object.freeze({
+  SNAPSHOT: 'task.snapshot',
+  ACCEPTED: 'task.accepted',
   SCHEDULED: 'task.scheduled',
   SCHEDULED_FIRED: 'task.scheduled.fired',
   RUNNING: 'task.running',
   DELEGATED: 'task.delegated',
   FINALIZING: 'task.finalizing',
   CANCELLING: 'task.cancelling',
+  UPDATED: 'task.updated',
   PROGRESS: 'task.progress',
-  PROGRESS_CHECK: 'task.progress.check',
   COMPLETED: 'task.completed',
   FAILED: 'task.failed',
   CANCELLED: 'task.cancelled',
   PERMISSION_REQUESTED: 'task.permission.requested',
   PERMISSION_RESOLVED: 'task.permission.resolved',
+  NOTIFICATION_PENDING: 'task.notification.pending',
+  NOTIFICATION_DELIVERED: 'task.notification.delivered',
   NOTIFICATION_OFFLINE: 'task.notification.offline',
 })
 
@@ -88,3 +91,19 @@ export const GATEWAY_SERVER_EVENT_TYPES = new Set([
   ...Object.values(GatewayServerEvent),
   ...Object.values(GatewayTaskEvent),
 ])
+
+export function isGatewayClientEvent(value) {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && GATEWAY_CLIENT_EVENT_TYPES.has(value.type),
+  )
+}
+
+export function isGatewayServerEvent(value) {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && GATEWAY_SERVER_EVENT_TYPES.has(value.type),
+  )
+}

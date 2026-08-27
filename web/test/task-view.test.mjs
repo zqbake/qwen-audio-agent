@@ -10,6 +10,8 @@ import {
   removeTaskInPhase,
   taskDeliverySettled,
   taskDetail,
+  taskIsActive,
+  taskNeedsPresentation,
   taskLabel,
   taskView,
 } from '../src/task-view.js'
@@ -17,11 +19,11 @@ import {
 test('presents every active coordinator request as one frontend processing phase', () => {
   assert.equal(phaseForTask({
     status: 'queued',
-    workState: 'active',
+    workState: 'submitted',
   }), 'queued')
   assert.equal(phaseForTask({
     status: 'running',
-    workState: 'active',
+    workState: 'working',
   }), 'running')
   assert.equal(taskLabel({ phase: 'queued' }), '排队中')
   assert.equal(taskLabel({ phase: 'running' }), '进行中')
@@ -30,15 +32,15 @@ test('presents every active coordinator request as one frontend processing phase
   assert.equal(taskLabel({ phase: 'cancelling' }), '正在取消')
   assert.equal(phaseForTask({
     status: 'finalizing',
-    workState: 'active',
+    workState: 'working',
   }), 'finalizing')
   assert.equal(phaseForTask({
     status: 'cancelling',
-    workState: 'active',
+    workState: 'working',
   }), 'cancelling')
   assert.equal(phaseForTask({
     status: 'delegated',
-    workState: 'active',
+    workState: 'working',
   }), 'delegated')
   assert.equal(taskDetail({
     phase: 'delegated',
@@ -58,6 +60,10 @@ test('presents every active coordinator request as one frontend processing phase
   }), 'cancelled')
   assert.equal(taskLabel({ phase: 'cancelled' }), '已取消')
   assert.equal(taskDetail({ phase: 'cancelled' }), '这项工作已停止')
+  assert.equal(taskIsActive({ workState: 'submitted' }), true)
+  assert.equal(taskIsActive({ workState: 'working' }), true)
+  assert.equal(taskIsActive({ workState: 'auth_required' }), true)
+  assert.equal(taskIsActive({ workState: 'completed' }), false)
 })
 
 test('separates backend completion from realtime result delivery', () => {
@@ -97,6 +103,22 @@ test('reconnect reconciliation recognizes terminal tasks already delivered', () 
   }), false)
   assert.equal(taskDeliverySettled({
     status: 'running',
+    notificationStatus: 'delivered',
+  }), false)
+  assert.equal(taskNeedsPresentation({
+    status: 'running',
+    workState: 'working',
+  }), true)
+  assert.equal(taskNeedsPresentation({
+    status: 'completed',
+    notificationStatus: 'pending',
+  }), true)
+  assert.equal(taskNeedsPresentation({
+    status: 'failed',
+    notificationStatus: 'delivering',
+  }), true)
+  assert.equal(taskNeedsPresentation({
+    status: 'completed',
     notificationStatus: 'delivered',
   }), false)
 })
@@ -147,6 +169,51 @@ test('shows ACP plan progress without exposing protocol details', () => {
       total: 3,
     }],
   }), '1/3 · Implement gameplay')
+})
+
+test('shows protocol Agent messages ahead of tool activity', () => {
+  assert.equal(taskDetail({
+    phase: 'running',
+    message: '已经读完资料，正在整理关键结论。',
+    activity: [{
+      kind: 'tool',
+      status: 'running',
+      category: 'read',
+    }],
+  }), '已经读完资料，正在整理关键结论。')
+
+  const updated = taskView({
+    id: 'task-message',
+    status: 'running',
+    objective: '整理资料',
+    message: '正在核对来源',
+  })
+  assert.equal(updated.message, '正在核对来源')
+})
+
+test('keeps backend-internal thinking, mode, and session state out of cards', () => {
+  assert.equal(taskDetail({
+    phase: 'running',
+    objective: '开发一个贪吃蛇游戏',
+    activity: [{ kind: 'thinking', status: 'running' }],
+  }), '开发一个贪吃蛇游戏')
+  assert.equal(taskDetail({
+    phase: 'running',
+    activity: [{ kind: 'thinking', status: 'running' }],
+  }), '正在执行任务')
+  assert.equal(taskDetail({
+    phase: 'running',
+    activity: [{ kind: 'mode', status: 'updated', mode: 'plan' }],
+  }), '正在执行任务')
+  assert.equal(taskDetail({
+    phase: 'running',
+    objective: '构建演示',
+    activity: [{
+      kind: 'session',
+      status: 'updated',
+      title: 'Build the demo',
+    }],
+  }), '构建演示')
 })
 
 test('prefers the active ACP step over later text and completed tools', () => {

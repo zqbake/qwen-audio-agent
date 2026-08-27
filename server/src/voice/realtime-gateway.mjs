@@ -3,61 +3,63 @@ import { randomUUID } from 'node:crypto'
 import {
   GatewayClientEvent,
   GatewayServerEvent,
+  isGatewayClientEvent,
 } from '../../../shared/realtime-events.mjs'
-import { AnnouncementManager } from './announcement/announcement-manager.mjs'
 import { AnnouncementWindow } from './announcement/announcement-window.mjs'
+import {
+  createTaskAnnouncementRuntime,
+  resolveTaskAnnouncementRuntime,
+} from './announcement/task-announcement-runtime.mjs'
 import { config } from '../core/config.mjs'
 import { logger } from '../core/logger.mjs'
 import { conversationSync } from '../conversation/conversation-sync.mjs'
 import { InputAssetRegistry } from './input-asset-registry.mjs'
 import { normalizeClientContext } from '../conversation/frontend-agent-context.mjs'
 import {
-  createRealtimeFrontend,
   defaultRealtimeProviderRegistry,
   realtimeEventErrorMessage,
 } from './realtime-provider.mjs'
 import { isAllowedOrigin } from '../core/request-security.mjs'
 import { taskManager } from '../task/task-manager.mjs'
+import { TaskDomainEvent } from '../task/task-events.mjs'
 import { recordTaskResult } from '../conversation/task-result-projector.mjs'
+import { projectGatewayTaskEvent } from '../transport/gateway-task-event-projector.mjs'
 import { ToolCallHandler } from './tools/tool-call-handler.mjs'
 import { TurnTranscripts } from './tools/turn-transcripts.mjs'
-import { TurnCorrelation } from './turn-correlation.mjs'
-import { streamingInputTranscript } from './input-transcript.mjs'
+import { TurnCitations } from './turn-citations.mjs'
+import { RealtimeInputRuntime } from './realtime-input-runtime.mjs'
 import {
-  ensureResponseContext,
-  mergeResponseContext,
-  responseActivityContextPatch,
-} from './response-context.mjs'
+  acceptsPlaybackReceipt,
+  confirmsTaskNotificationOnPlaybackStart,
+  RealtimePresentationRuntime,
+} from './realtime-presentation-runtime.mjs'
+import { RealtimeTurnState } from './realtime-turn-state.mjs'
 import {
   ActiveVoiceClients,
   clientVoiceCapabilities,
 } from './active-voice-clients.mjs'
-import { ReconnectBackoff } from './reconnect-backoff.mjs'
-import { realtimeConnectionStatus } from './realtime-connection-status.mjs'
+import { RealtimeProviderSession } from './realtime-provider-session.mjs'
 import { SleepController } from './sleep-controller.mjs'
 import { DictationSession } from './dictation-session.mjs'
 import { createSherpaWakeWordDetector } from './wake-word/sherpa-detector.mjs'
-import {
-  evaluateResponseGuards,
-  isResponseGuardTurnCurrent,
-} from './response-guards/index.mjs'
 import {
   isResponseActivityEvent,
   realtimeResponseId,
 } from './response-lifecycle.mjs'
 import {
-  displayInputText,
-  inputFileParts,
-  inputText,
-  normalizeInputParts,
-  withAttachmentAnchors,
-} from '../../../shared/input-parts.mjs'
+  frontendSourceToolCapabilities,
+  frontendSourceToolDefinitions,
+} from '../frontend/tools/frontend-tool-source.mjs'
 
 const MAX_PENDING_AUDIO_CHUNKS = 30
 const RESPONSE_START_WATCHDOG_MS = 12000
 const PERMISSION_RESPONSE_GRACE_MS = 800
 const RESPONSE_CONTEXT_CLEANUP_MS = 30000
 const REALTIME_STABLE_CONNECTION_MS = 10000
+
+function gatewayTurnId() {
+  return `gateway_${randomUUID().replaceAll('-', '')}`
+}
 
 function send(ws, event) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
@@ -83,22 +85,9 @@ export function isSleepActivityEvent(event = {}) {
   ].includes(event.type)
 }
 
-export function confirmsTaskNotificationOnPlaybackStart(context) {
-  return Boolean(
-    context
-    && (
-      context.origin === 'announcement'
-      || context.consumesTaskNotification
-    ),
-  )
-}
-
-export function acceptsPlaybackReceipt({
-  outputEnabled,
-  active,
-  responseKnown,
-}) {
-  return outputEnabled === true && active === true && responseKnown === true
+export {
+  acceptsPlaybackReceipt,
+  confirmsTaskNotificationOnPlaybackStart,
 }
 
 function clientDescriptor(event = {}) {
@@ -118,9 +107,9 @@ export function attachRealtimeGateway(server, {
   memoryService,
   memoryExtractor = null,
   notesStore,
-  coordinator,
+  backendRuntime,
   backendAvailability = null,
-  respondPermission,
+  respondAuthorization,
   permissionPolicy,
   inputAssets = new InputAssetRegistry(),
   inputArbitration = null,
@@ -128,10 +117,21 @@ export function attachRealtimeGateway(server, {
   defaultRealtimeProvider = config.audioProvider,
   dictation = { enabled: false },
   conversationService = conversationSync,
+  frontendRetrieval = null,
+  frontendKnowledge = null,
+  frontendToolSources = [],
+  taskAnnouncementFactory = createTaskAnnouncementRuntime,
 }) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 20 * 1024 * 1024 })
   const activeVoiceClients = new ActiveVoiceClients()
   const voiceConnections = new Map()
+  const frontendToolSourcesReady = Promise.all(
+    frontendToolSources.map(source => source.initialize()),
+  ).catch(error => {
+    logger.warn('frontend_tools.initialization_failed', {
+      error: error.message,
+    })
+  })
 
   // A suspension is global, not per owner: the host is taking the machine's
   // microphone, so every connected client has to let go of it. The subscription
@@ -184,15 +184,6 @@ export function attachRealtimeGateway(server, {
       sessionId,
     })
     connectionLogger.info('voice_client.connected')
-    let frontend
-    let connectPromise
-    let pendingAudio = []
-    let turnId = ''
-    let turnGeneration = 0
-    let turnSequence = 0
-    let committedTurnId = ''
-    let committedTurnGeneration = 0
-    let userSpeaking = false
     let inputEnabled = false
     let outputEnabled = false
     // Set only by host arbitration. Unlike inputEnabled (which the client
@@ -200,17 +191,10 @@ export function attachRealtimeGateway(server, {
     // capturing, so nothing here may re-enable audio on its own.
     let inputSuspended = inputArbitration?.suspended === true
     let nonVoiceClient = false
-    // Realtime front end for this session. Defaults to the configured provider
-    // and can be switched by the client through the connect event.
-    let sessionProvider = defaultRealtimeProvider
     let descriptor = clientDescriptor()
     let responseTurnCandidate = null
-    let manualInputGeneration = null
     let responseStartWatchdog = null
     let permissionResponseTimer = null
-    let scheduledRealtimeReconnect = null
-    let realtimeConnectedAt = 0
-    let realtimeBlockedError = ''
     let sleeping = false
     let waking = false
     let explicitSleepRequested = false
@@ -222,7 +206,7 @@ export function attachRealtimeGateway(server, {
     if (dictation.enabled) {
       try {
         dictationAdapter = realtimeProviderRegistry.resolveDictation(
-          dictation.provider || sessionProvider,
+          dictation.provider || defaultRealtimeProvider,
         )
       } catch {
         // Visible failure is emitted on START. Disabled/unsupported adapters
@@ -252,23 +236,35 @@ export function attachRealtimeGateway(server, {
       },
     })
     let sleepController
-    const realtimeReconnectBackoff = new ReconnectBackoff()
     const announcementWindow = new AnnouncementWindow()
-    const playbackTurns = new Map()
     const notificationClaimantId = `voice_${randomUUID()}`
     let clientContext = normalizeClientContext()
-    const responseContexts = new Map()
-    const inputTurns = new TurnCorrelation()
+    const turns = new RealtimeTurnState()
     const transcripts = new TurnTranscripts()
+    const turnCitations = new TurnCitations()
     const announcedPermissions = new Set()
     let permissionRetryTimer = null
+    let realtimeSession
     const activeSessionTasks = () => taskManager.list({
       ownerId,
       sessionId,
       active: true,
     })
+    const getAgentContext = () => ({
+      client: clientContext,
+      frontend: {
+        capabilities: [...new Set([
+          ...(frontendRetrieval?.capabilities?.() || []),
+          ...(frontendKnowledge?.capabilities?.() || []),
+          ...frontendSourceToolCapabilities(frontendToolSources),
+        ])],
+        tools: frontendSourceToolDefinitions(frontendToolSources),
+      },
+      memories: memoryService?.list(ownerId, { limit: 64 }) || [],
+      recentMessages: conversationService.frontendContext({ ownerId, sessionId }),
+    })
     const schedulePermissionRetry = () => {
-      if (permissionRetryTimer || !outputEnabled || !frontend?.ready) return
+      if (permissionRetryTimer || !outputEnabled || !realtimeSession?.ready) return
       permissionRetryTimer = setTimeout(() => {
         permissionRetryTimer = null
         announcePendingPermissions()
@@ -279,17 +275,19 @@ export function attachRealtimeGateway(server, {
       const permission = task?.authorization
       if (
         !outputEnabled
-        || !frontend?.ready
+        || !realtimeSession?.ready
         || permission?.status !== 'pending'
         || announcedPermissions.has(permission.id)
       ) return
-      if (userSpeaking || announcementWindow.isBlocked()) {
+      if (turns.userSpeaking || announcementWindow.isBlocked()) {
         schedulePermissionRetry()
         return
       }
       announcedPermissions.add(permission.id)
-      frontend.injectPermission(permission, {
-        turnId: task.turnId,
+      realtimeSession.frontend.injectPermission(permission, {
+        // A permission prompt is a new model input and response. taskId keeps
+        // it correlated with the work without reusing the user's old turn.
+        turnId: gatewayTurnId(),
         taskId: task.id,
         authorizationId: permission.id,
       }, {
@@ -320,32 +318,124 @@ export function attachRealtimeGateway(server, {
       }
       activeTasks.forEach(announcePermission)
     }
-    const announcements = new AnnouncementManager({
-      getFrontend: () => frontend,
-      isDeliveryBlocked: () => sleeping || waking || !outputEnabled || announcementWindow.isBlocked(),
-      announceIntoContext: config.announceIntoContext,
-      resultContextMaxChars: config.resultContextMaxChars,
-      maxBatchItems: config.announcementMaxBatchItems,
-      batchWindowMs: config.announcementBatchMs,
-      acknowledgementTimeoutMs: config.announcementAcknowledgementTimeoutMs,
-      maxRetryAttempts: config.announcementMaxRetryAttempts,
-      leaseRenewIntervalMs: Math.max(
-        1000,
-        Math.floor(config.taskNotificationClaimTtlMs / 3),
-      ),
-      onDelivered: taskIds => taskManager.markNotificationsDelivered(taskIds, {
-        claimantId: notificationClaimantId,
+    const taskAnnouncements = resolveTaskAnnouncementRuntime(
+      taskAnnouncementFactory,
+      {
+        resultOptions: {
+          getFrontend: () => realtimeSession?.frontend,
+          isDeliveryBlocked: () => (
+            sleeping
+            || waking
+            || !outputEnabled
+            || announcementWindow.isBlocked()
+          ),
+          announceIntoContext: config.announceIntoContext,
+          resultContextMaxChars: config.resultContextMaxChars,
+          maxBatchItems: config.announcementMaxBatchItems,
+          batchWindowMs: config.announcementBatchMs,
+          acknowledgementTimeoutMs: config.announcementAcknowledgementTimeoutMs,
+          maxRetryAttempts: config.announcementMaxRetryAttempts,
+          leaseRenewIntervalMs: Math.max(
+            1000,
+            Math.floor(config.taskNotificationClaimTtlMs / 3),
+          ),
+          onDelivered: taskIds => taskManager.markNotificationsDelivered(taskIds, {
+            claimantId: notificationClaimantId,
+          }),
+          onLeaseRenew: taskIds => taskManager.renewNotificationClaims(taskIds, {
+            claimantId: notificationClaimantId,
+          }),
+          onRelease: taskIds => taskManager.releaseNotificationClaims(taskIds, {
+            claimantId: notificationClaimantId,
+          }),
+          onError: error => send(ws, {
+            type: 'error',
+            message: `后台结果暂时无法播报，正在自动重试：${error.message}`,
+          }),
+        },
+        progressOptions: {
+          getFrontend: () => realtimeSession?.frontend,
+          isDeliveryBlocked: () => (
+            sleeping
+            || waking
+            || !outputEnabled
+            || !realtimeSession?.ready
+            || turns.userSpeaking
+            || announcementWindow.isBlocked()
+          ),
+          isTaskActive: taskId => activeSessionTasks().some(task => (
+            task.id === taskId
+          )),
+          intervalMs: 60_000,
+          quietMs: config.announcementQuietMs,
+          onError: error => connectionLogger.warn('progress.injection_failed', {
+            error: error.message,
+          }),
+        },
+      },
+    )
+    const announcements = taskAnnouncements.results
+    const progressAnnouncements = taskAnnouncements.progress
+    const reportFrontendError = error => {
+      if (error?.realtimeConnectionReported) return
+      if (error) error.realtimeConnectionReported = true
+      send(ws, { type: GatewayServerEvent.ERROR, message: error?.message || String(error) })
+    }
+    realtimeSession = new RealtimeProviderSession({
+      providerRegistry: realtimeProviderRegistry,
+      defaultProvider: defaultRealtimeProvider,
+      getAgentContext,
+      shouldReconnect: () => inputEnabled || outputEnabled,
+      onEvent: event => handleEvent(event),
+      onDiagnostic: diagnostic => {
+        const { event, ...fields } = diagnostic
+        connectionLogger.warn(event, fields)
+      },
+      onConnected: () => announcePendingPermissions(),
+      onReady: createdFrontend => {
+        const resumedFromSleep = waking
+        waking = false
+        if (outputEnabled) claimPendingNotifications()
+        send(ws, {
+          type: GatewayServerEvent.VOICE_READY,
+          inputSampleRate: createdFrontend.provider.inputSampleRate,
+          provider: createdFrontend.provider.key,
+          providerLabel: createdFrontend.provider.label,
+        })
+        prepareSleepMode()
+        sleepController.recordActivity()
+        progressAnnouncements.flush()
+        if (resumedFromSleep) {
+          send(ws, {
+            type: GatewayServerEvent.VOICE_SLEEP,
+            state: 'awake',
+            wakeWord: config.wakeWord,
+          })
+          announcePendingPermissions()
+          claimPendingNotifications()
+          announcements.flush()
+        }
+      },
+      onDisconnected: () => send(ws, {
+        type: GatewayServerEvent.VOICE_STATE,
+        state: 'idle',
       }),
-      onLeaseRenew: taskIds => taskManager.renewNotificationClaims(taskIds, {
-        claimantId: notificationClaimantId,
+      onReconnected: () => {
+        announcements.flush()
+        progressAnnouncements.flush()
+      },
+      onConnectionState: event => send(ws, {
+        type: GatewayServerEvent.VOICE_CONNECTION,
+        ...event,
       }),
-      onRelease: taskIds => taskManager.releaseNotificationClaims(taskIds, {
-        claimantId: notificationClaimantId,
+      onError: reportFrontendError,
+      onReconnectError: error => send(ws, {
+        type: GatewayServerEvent.ERROR,
+        message: `实时语音连接恢复失败：${error.message}`,
       }),
-      onError: error => send(ws, {
-        type: 'error',
-        message: `后台结果暂时无法播报，正在自动重试：${error.message}`,
-      }),
+      logger: connectionLogger,
+      maxPendingAudioChunks: MAX_PENDING_AUDIO_CHUNKS,
+      stableConnectionMs: REALTIME_STABLE_CONNECTION_MS,
     })
     const voiceClient = {
       ws,
@@ -360,9 +450,9 @@ export function attachRealtimeGateway(server, {
         if (suspend) {
           dictationSession.suspend(status.owner)
           // Buffered audio predates the suspension and is no longer wanted.
-          pendingAudio = []
+          realtimeSession.clearPendingAudio()
           sleepController?.disable()
-          frontend?.cancel()
+          realtimeSession.cancelResponse()
           send(ws, { type: GatewayServerEvent.PLAYBACK_CLEAR, reason: 'input_suspended' })
           send(ws, {
             type: GatewayServerEvent.INPUT_SUSPEND,
@@ -383,13 +473,9 @@ export function attachRealtimeGateway(server, {
         send(ws, { type: GatewayServerEvent.INPUT_RESUME })
         prepareSleepMode()
       },
-      realtimeStatus: () => realtimeConnectionStatus({
-        provider: sessionProvider,
-        blockedError: realtimeBlockedError,
+      realtimeStatus: () => realtimeSession.status({
         sleeping,
         waking,
-        ready: frontend?.ready === true,
-        connecting: Boolean(connectPromise),
       }),
       // Lets the arbitration evict this owner once its socket has died without
       // a clean close, so a stale holder never blocks a new voice claim.
@@ -400,11 +486,10 @@ export function attachRealtimeGateway(server, {
         sleepController?.disable()
         inputEnabled = false
         outputEnabled = false
-        pendingAudio = []
         announcementWindow.reset()
         announcements.pause()
-        cancelScheduledRealtimeReconnect()
-        frontend?.close()
+        progressAnnouncements.clear()
+        realtimeSession.close({ notifyDisconnected: true })
         send(ws, { type: 'playback.clear' })
         send(ws, {
           type: 'voice.deactivated',
@@ -433,6 +518,7 @@ export function attachRealtimeGateway(server, {
     const releaseVoiceClient = () => {
       inputEnabled = false
       outputEnabled = false
+      progressAnnouncements.clear()
       if (activeVoiceClients.release(ownerId, voiceClient)) {
         broadcastVoiceOwnership(ownerId)
       }
@@ -442,22 +528,18 @@ export function attachRealtimeGateway(server, {
       ownerId,
       sessionId,
       transcripts,
-      getFrontend: () => frontend,
-      getTurnId: () => committedTurnId,
-      getTurnGeneration: () => committedTurnGeneration,
+      getFrontend: () => realtimeSession.frontend,
+      getTurnId: () => turns.committedTurnId,
+      getTurnGeneration: () => turns.committedTurnGeneration,
       memoryService,
       notesStore,
       getClientContext: () => clientContext,
-      getConversationContext: () => conversationService.frontendContext({
-        ownerId,
-        sessionId,
-      }),
-      onMemoryChanged: () => frontend?.updateAgentContext({
+      onMemoryChanged: () => realtimeSession.updateAgentContext({
         memories: memoryService?.list(ownerId, { limit: 64 }) || [],
       }),
-      coordinator,
+      backendRuntime,
       backendAvailability,
-      respondPermission,
+      respondAuthorization,
       permissionPolicy,
       // The permission decision was accepted locally but never reached the
       // backend: the authorization is still pending there, so clear the
@@ -483,27 +565,11 @@ export function attachRealtimeGateway(server, {
         ...activity,
       }),
       inputAssets,
+      frontendRetrieval,
+      frontendKnowledge,
+      frontendToolSources,
+      turnCitations,
     })
-    const currentTurn = () => ({
-      turnId,
-      turnGeneration,
-    })
-    const rememberInputTurn = (itemId, context) => {
-      inputTurns.remember(itemId, context)
-    }
-    const inputTurn = event => (
-      inputTurns.resolve(event.item_id, currentTurn())
-    )
-    const commitTurn = context => {
-      if (!context?.turnId) return
-      if (
-        committedTurnId === context.turnId
-        && committedTurnGeneration === context.turnGeneration
-      ) return
-      if (context.turnGeneration < committedTurnGeneration) return
-      committedTurnId = context.turnId
-      committedTurnGeneration = context.turnGeneration
-    }
     const clearResponseCandidate = () => {
       clearTimeout(responseStartWatchdog)
       clearTimeout(permissionResponseTimer)
@@ -512,52 +578,6 @@ export function attachRealtimeGateway(server, {
       responseTurnCandidate = null
     }
 
-    const cancelScheduledRealtimeReconnect = () => {
-      const scheduled = scheduledRealtimeReconnect
-      if (!scheduled) return
-      scheduledRealtimeReconnect = null
-      clearTimeout(scheduled.timer)
-      scheduled.resolve()
-    }
-
-    const scheduleRealtimeReconnect = () => {
-      if (realtimeBlockedError) return Promise.resolve()
-      if (frontend?.ready) return Promise.resolve()
-      if (scheduledRealtimeReconnect) {
-        return scheduledRealtimeReconnect.promise
-      }
-      let resolveScheduled
-      let rejectScheduled
-      const promise = new Promise((resolve, reject) => {
-        resolveScheduled = resolve
-        rejectScheduled = reject
-      })
-      const scheduled = {
-        promise,
-        resolve: resolveScheduled,
-        reject: rejectScheduled,
-        timer: null,
-      }
-      scheduled.timer = setTimeout(() => {
-        if (scheduledRealtimeReconnect !== scheduled) {
-          scheduled.resolve()
-          return
-        }
-        // Clear the waiting state before connecting. If this attempt closes,
-        // its onClose callback can schedule the next backoff step without
-        // colliding with the promise for the attempt that just started.
-        scheduledRealtimeReconnect = null
-        connectFrontendNow().then(scheduled.resolve, scheduled.reject)
-      }, realtimeReconnectBackoff.next())
-      scheduled.timer.unref?.()
-      scheduledRealtimeReconnect = scheduled
-      return promise
-    }
-    const reportFrontendError = error => {
-      if (error?.realtimeConnectionReported) return
-      if (error) error.realtimeConnectionReported = true
-      send(ws, { type: 'error', message: error?.message || String(error) })
-    }
     const ensurePermissionResponseFor = context => {
       clearTimeout(permissionResponseTimer)
       const hasPendingPermission = () => activeSessionTasks().some(task => (
@@ -566,7 +586,7 @@ export function attachRealtimeGateway(server, {
       if (!hasPendingPermission()) return
       permissionResponseTimer = setTimeout(() => {
         permissionResponseTimer = null
-        frontend?.ensureResponse({
+        realtimeSession.frontend?.ensureResponse({
           turnId: context.turnId,
           turnGeneration: context.turnGeneration,
         }, {
@@ -601,16 +621,52 @@ export function attachRealtimeGateway(server, {
           turnId: context.turnId,
           origin: 'model',
         })
-        const staleFrontend = frontend
-        frontend = null
-        staleFrontend?.close()
-        scheduleRealtimeReconnect().catch(error => send(ws, {
+        realtimeSession.reconnect().catch(error => send(ws, {
           type: 'error',
           message: error.message,
         }))
-      }, frontend?.provider.responseStartTimeoutMs ?? RESPONSE_START_WATCHDOG_MS)
+      }, realtimeSession.frontend?.provider.responseStartTimeoutMs
+        ?? RESPONSE_START_WATCHDOG_MS)
       responseStartWatchdog.unref?.()
     }
+
+    const inputs = new RealtimeInputRuntime({
+      ownerId,
+      sessionId,
+      turns,
+      transcripts,
+      inputAssets,
+      conversationSync: conversationService,
+      announcementWindow,
+      announcements,
+      send: event => send(ws, event),
+      getFrontend: () => realtimeSession.frontend,
+      ensureFrontend: () => realtimeSession.ensure(),
+      clearResponseCandidate,
+      expectResponseFor,
+      shouldEnsurePermissionResponse: context => responseTurnCandidate === context,
+      ensurePermissionResponseFor,
+      reportFrontendError,
+    })
+
+    const presentationRuntime = new RealtimePresentationRuntime({
+      ownerId,
+      sessionId,
+      turns,
+      conversationSync: conversationService,
+      announcementWindow,
+      announcements,
+      toolCalls,
+      send: event => send(ws, event),
+      getFrontend: () => realtimeSession.frontend,
+      getOutputEnabled: () => outputEnabled,
+      getNonVoiceClient: () => nonVoiceClient,
+      getResponseTurnCandidate: () => responseTurnCandidate,
+      clearResponseCandidate,
+      announcementQuietMs: config.announcementQuietMs,
+      responseContextCleanupMs: RESPONSE_CONTEXT_CLEANUP_MS,
+      turnCitations,
+    })
 
     const queueNotification = task => {
       if (task.status === 'completed') {
@@ -626,252 +682,11 @@ export function attachRealtimeGateway(server, {
       task,
     })
 
-    const contextTaskIds = context => (
-      context?.taskIds?.length ? context.taskIds : [context?.taskId].filter(Boolean)
-    )
-
-    const publicResponseContext = context => ({
-      turnId: context.turnId,
-      taskId: context.taskId,
-      taskIds: context.taskIds,
-      turnIds: context.turnIds,
-      origin: context.origin,
-      turnGeneration: context.turnGeneration,
-      deliverySequence: context.deliverySequence,
-    })
-
-    const fallbackResponseContext = () => ({
-      turnId: committedTurnId || turnId,
-      taskId: null,
-      origin: 'model',
-      turnGeneration: committedTurnId
-        ? committedTurnGeneration
-        : turnGeneration,
-    })
-
-    const emitAssistantTranscript = ({
-      id,
-      context,
-      content,
-      final,
-    }) => {
-      if (final) {
-        conversationService.record({
-          ownerId,
-          sessionId,
-          id: `voice:assistant:${id}`,
-          role: 'assistant',
-          content,
-          source: context.origin === 'model' ? 'realtime-direct' : 'agent-presentation',
-          ...context,
-        })
-      }
-      send(ws, {
-        type: final ? 'transcript.final' : 'transcript.delta',
-        role: 'assistant',
-        content: content || '',
-        responseId: id,
-        ...publicResponseContext(context),
-      })
-    }
-
-    const flushPendingTranscripts = (id, context) => {
-      for (const transcript of context?.pendingTranscripts || []) {
-        emitAssistantTranscript({
-          id,
-          context,
-          content: transcript.content,
-          final: transcript.final,
-        })
-      }
-      if (context) context.pendingTranscripts = []
-    }
-
-    const finishResponseContextIfComplete = (id, context) => {
-      if (
-        context
-        && context.playbackEnded
-        && context.responseDone
-        && context.transcriptDone
-      ) {
-        responseContexts.delete(id)
-      }
-    }
-
-    const scheduleResponseContextCleanup = (id, context) => {
-      const timer = setTimeout(() => {
-        if (responseContexts.get(id) !== context) return
-        responseContexts.delete(id)
-        playbackTurns.delete(id)
-        announcementWindow.finishPlayback(id, {
-          hasFunctionCall: Boolean(context?.hasFunctionCall),
-        })
-      }, RESPONSE_CONTEXT_CLEANUP_MS)
-      timer.unref?.()
-    }
-
-    const startPlayback = id => {
-      const context = responseContexts.get(id)
-      // A cancelled response remains as a short-lived tombstone so late
-      // provider audio and client receipts cannot resurrect it.
-      if (context?.suppressed) return
-      announcementWindow.startPlayback(id)
-      const playbackTurnId = context?.turnId || playbackTurns.get(id) || turnId
-      send(ws, {
-        type: 'voice.state',
-        state: 'speaking',
-        turnId: playbackTurnId,
-        origin: context?.origin || 'model',
-      })
-      if (!context || context.playbackStarted) return
-      context.playbackStarted = true
-      if (confirmsTaskNotificationOnPlaybackStart(context)) {
-        announcements.confirmMany(contextTaskIds(context))
-      }
-      flushPendingTranscripts(id, context)
-    }
-
-    const cancelQueuedPlayback = (id, { reason = '' } = {}) => {
-      const context = responseContexts.get(id)
-      announcementWindow.finishPlayback(id, {
-        hasFunctionCall: Boolean(context?.hasFunctionCall),
-      })
-      const playbackTurnId = playbackTurns.get(id) || turnId
-      playbackTurns.delete(id)
-      if (context?.origin === 'announcement') {
-        if (reason === 'user_interruption') {
-          announcements.confirmMany(contextTaskIds(context))
-        } else {
-          announcements.retryMany(contextTaskIds(context))
-        }
-      }
-      if (context?.playbackStarted && reason === 'user_interruption') {
-        send(ws, {
-          type: 'response.interrupted',
-          responseId: id,
-          ...publicResponseContext(context),
-        })
-      }
-      if (context) {
-        context.suppressed = true
-        context.playbackEnded = true
-        context.pendingTranscripts = []
-        scheduleResponseContextCleanup(id, context)
-      }
-      send(ws, {
-        type: 'voice.state',
-        state: userSpeaking ? 'listening' : 'idle',
-        turnId: userSpeaking ? turnId : playbackTurnId,
-        origin: context?.origin || 'model',
-      })
-      const timer = setTimeout(
-        () => announcements.flush(),
-        config.announcementQuietMs,
-      )
-      timer.unref?.()
-    }
-
-    const beginResponseLifecycle = event => {
-      const id = realtimeResponseId(event)
-      if (!id) return null
-      const existing = responseContexts.get(id)
-      const automaticResponse = (
-        !existing
-        && (event.__voiceOrigin || 'model') === 'model'
-        && !event.__voiceContext?.turnId
-      )
-      const automaticTurn = automaticResponse
-        ? responseTurnCandidate
-        : null
-      const fallback = {
-        turnId: event.__voiceContext?.turnId
-          || automaticTurn?.turnId
-          || committedTurnId
-          || turnId,
-        taskId: event.__voiceContext?.taskId || null,
-        origin: event.__voiceOrigin || 'model',
-        authorizationId: event.__voiceContext?.authorizationId || null,
-        turnGeneration: Number.isInteger(event.__voiceContext?.turnGeneration)
-          ? event.__voiceContext.turnGeneration
-          : automaticTurn?.turnGeneration
-            ?? (committedTurnId ? committedTurnGeneration : turnGeneration),
-      }
-      const context = mergeResponseContext(
-        responseContexts,
-        id,
-        responseActivityContextPatch({ existing, event, fallback }),
-      )
-      if (
-        manualInputGeneration !== null
-        && !automaticResponse
-        && context.turnGeneration === manualInputGeneration
-        && context.origin === 'model'
-      ) {
-        manualInputGeneration = null
-      }
-      // Compatible Realtime servers may omit response.created and reveal the
-      // correlation only on response.done. If audio already reached the
-      // client, confirm the newly identified task notification immediately.
-      if (
-        context.playbackStarted
-        && confirmsTaskNotificationOnPlaybackStart(context)
-      ) {
-        announcements.confirmMany(contextTaskIds(context))
-      }
-      if (automaticTurn) {
-        // Some OpenAI-compatible servers start an implicit server-VAD response
-        // with transcript or audio output and omit response.created. Any valid
-        // response output proves that turn detection accepted this turn.
-        commitTurn(automaticTurn)
-        clearResponseCandidate()
-      }
-      if (!context.responseStarted) {
-        context.responseStarted = true
-        send(ws, {
-          type: 'response.started',
-          responseId: id,
-          ...publicResponseContext(context),
-        })
-      }
-      return context
-    }
-
-    const finishPlayback = id => {
-      const playbackTurnId = playbackTurns.get(id) || turnId
-      const context = responseContexts.get(id)
-      if (context?.suppressed) {
-        playbackTurns.delete(id)
-        return
-      }
-      announcementWindow.finishPlayback(id, {
-        hasFunctionCall: Boolean(context?.hasFunctionCall),
-      })
-      playbackTurns.delete(id)
-      if (context) {
-        context.playbackEnded = true
-        finishResponseContextIfComplete(id, context)
-        if (responseContexts.get(id) === context) {
-          scheduleResponseContextCleanup(id, context)
-        }
-      }
-      send(ws, {
-        type: 'voice.state',
-        state: userSpeaking ? 'listening' : 'idle',
-        turnId: userSpeaking ? turnId : playbackTurnId,
-        origin: context?.origin || 'model',
-      })
-      const timer = setTimeout(
-        () => announcements.flush(),
-        config.announcementQuietMs,
-      )
-      timer.unref?.()
-    }
-
     const claimPendingNotifications = (
       taskIds,
       { includeOtherSessions = !taskIds?.length } = {},
     ) => {
-      if (!outputEnabled || !frontend?.ready) return
+      if (!outputEnabled || !realtimeSession.ready) return
       const claimed = taskManager.claimNotifications({
         ownerId,
         sessionId,
@@ -888,37 +703,7 @@ export function attachRealtimeGateway(server, {
     const unsubscribeTasks = taskManager.subscribe(event => {
       const task = event.task
       if (event.ownerId !== ownerId) return
-      if (event.type === 'task.progress.check') {
-        if (task.sessionId !== sessionId) return
-        if (!outputEnabled || !frontend?.ready) return
-        const progressContext = {
-          taskId: task.id,
-          turnId: null,
-          taskIds: [task.id],
-          deliverySequence: null,
-        }
-        const progressText = [
-          '[PROGRESS]',
-          '<qwen_audio_agent_progress>',
-          '这是后台任务的进度更新，不是最终结果，也不是用户的新请求。',
-          '用一句自然的话简短说明进度，不要调用工具。',
-          event.message,
-          '</qwen_audio_agent_progress>',
-        ].join('\n')
-        frontend.injectResult(
-          progressText,
-          'progress',
-          progressContext,
-          { injectContext: true },
-        ).catch(error => {
-          connectionLogger.warn('progress.injection_failed', {
-            taskId: task.id,
-            error: error.message,
-          })
-        })
-        return
-      }
-      if (event.type === 'task.notification.pending') {
+      if (event.type === TaskDomainEvent.NOTIFICATION_PENDING) {
         if (sleeping) {
           wakeFromSleep()
           return
@@ -929,239 +714,76 @@ export function attachRealtimeGateway(server, {
         return
       }
       if (task.sessionId !== sessionId) return
-      send(ws, {
-        type: event.type,
-        task,
-        ...(event.permission ? { permission: event.permission } : {}),
-      })
-      if (event.type === 'task.permission.requested') {
+      const publicEvent = projectGatewayTaskEvent(event)
+      if (publicEvent) send(ws, publicEvent)
+      if (
+        event.type === TaskDomainEvent.UPDATED
+        && event.message
+        && outputEnabled
+        && !sleeping
+        && !waking
+      ) {
+        progressAnnouncements.offer({
+          taskId: task.id,
+          startedAt: task.startedAt,
+          message: event.message,
+        })
+      }
+      if (event.type === TaskDomainEvent.PERMISSION_REQUESTED) {
         if (sleeping) {
           wakeFromSleep()
           return
         }
         announcePermission(task)
       }
-      if (event.type === 'task.permission.resolved') {
+      if (event.type === TaskDomainEvent.PERMISSION_RESOLVED) {
         const authorizationId = event.permission?.id
+        // A permission confirmation already tells the user that work resumes.
+        // Drop progress queued before the decision so it cannot immediately
+        // repeat the same “still working” information after that confirmation.
+        progressAnnouncements.remove(task.id)
         if (authorizationId) {
           // 已进入对话的权限询问被其它通道（如 WebUI 按钮）处理后，把结果
           // 静默回注模型上下文：避免模型不知情而重复追问，或把用户随后的
           // 口头确认误报为“请求已失效”。
-          if (announcedPermissions.has(authorizationId) && frontend?.ready) {
-            frontend.appendUserInputContext([{
+          if (announcedPermissions.has(authorizationId) && realtimeSession.ready) {
+            realtimeSession.frontend.appendUserInputContext([{
               type: 'text',
               text: '（系统提示：刚才的后台权限请求已处理完毕，任务继续执行；'
                 + '无需再询问或回应该请求。）',
             }]).catch(() => {})
           }
           announcedPermissions.delete(authorizationId)
-          frontend?.cancelResponses((context, origin) => (
+          realtimeSession.frontend?.cancelResponses((context, origin) => (
             origin === 'permission'
             && context?.authorizationId === authorizationId
           ))
-          for (const [responseId, context] of responseContexts) {
-            if (
-              context.origin === 'permission'
-              && context.authorizationId === authorizationId
-              && !context.suppressed
-            ) {
-              cancelQueuedPlayback(responseId, {
-                reason: 'permission_resolved',
-              })
-            }
-          }
+          presentationRuntime.cancelPermission(authorizationId)
         }
       }
-      if (event.type === 'task.delegated') {
-        const presentation = task.delegation?.presentation
-        if (presentation?.inline?.content) {
-          send(ws, {
-            type: 'timeline.inline',
-            item: {
-              id: `inline_${task.id}_delegated`,
-              taskId: task.id,
-              turnId: task.turnId || null,
-              ...presentation.inline,
-            },
-          })
-        }
+      if ([
+        TaskDomainEvent.COMPLETED,
+        TaskDomainEvent.FAILED,
+        TaskDomainEvent.CANCELLED,
+      ].includes(event.type)) {
+        progressAnnouncements.remove(task.id)
       }
-      if (['task.completed', 'task.failed'].includes(event.type)) {
+      if ([
+        TaskDomainEvent.COMPLETED,
+        TaskDomainEvent.FAILED,
+      ].includes(event.type)) {
         recordResult(task)
-        const inline = task.resultMetadata?.presentation?.inline
-        if (inline?.content) {
-          send(ws, {
-            type: 'timeline.inline',
-            item: {
-              id: `inline_${task.id}`,
-              taskId: task.id,
-              turnId: task.turnId || null,
-              ...inline,
-            },
-          })
-        }
         claimPendingNotifications([task.id])
       }
     })
 
     const handleEvent = event => {
       if (isSleepActivityEvent(event)) sleepController?.recordActivity()
-      if (isResponseActivityEvent(event)) beginResponseLifecycle(event)
-      if (event.type === 'input_audio_buffer.speech_started') {
-        // A discrete text/image submission owns the turn until its response
-        // starts. Provider-side VAD events caused by audio already in flight
-        // belong to the superseded voice turn and must not take ownership back.
-        if (manualInputGeneration !== null) {
-          inputTurns.invalidate(event.item_id)
-          return
-        }
-        userSpeaking = true
-        clearResponseCandidate()
-        const knownTurn = event.item_id
-          ? inputTurns.resolve(event.item_id, null)
-          : null
-        if (knownTurn) {
-          turnId = knownTurn.turnId
-          turnGeneration = knownTurn.turnGeneration
-        } else {
-          turnGeneration = ++turnSequence
-          turnId = `voice-${Date.now()}-${turnGeneration}`
-          rememberInputTurn(event.item_id, currentTurn())
-        }
-        announcementWindow.beginTurn(turnId)
-        announcements.dismissActive()
-        send(ws, {
-          type: 'playback.clear',
-          reason: 'user_interruption',
-        })
-        send(ws, { type: 'turn.started', turnId })
-        send(ws, { type: 'voice.state', state: 'listening', turnId })
-        frontend?.cancel()
-      } else if (event.type === 'input_audio_buffer.speech_stopped') {
-        const stoppedTurn = inputTurn(event)
-        if (
-          inputTurns.isInvalid(event.item_id)
-          || stoppedTurn?.turnGeneration < committedTurnGeneration
-        ) {
-          inputTurns.invalidate(event.item_id)
-          return
-        }
-        userSpeaking = false
-        announcementWindow.endSpeech()
-        if (event.reason === 'turn_invalid') {
-          if (event.item_id) {
-            inputTurns.invalidate(event.item_id)
-          }
-          send(ws, {
-            type: 'transcript.discard',
-            role: 'user',
-            turnId: stoppedTurn.turnId,
-            reason: 'turn_invalid',
-          })
-          send(ws, {
-            type: 'voice.state',
-            state: 'idle',
-            turnId: stoppedTurn.turnId,
-            origin: 'model',
-          })
-        } else {
-          expectResponseFor(stoppedTurn)
-          send(ws, {
-            type: 'voice.state',
-            state: 'processing',
-            turnId: stoppedTurn.turnId,
-            origin: 'model',
-          })
-        }
-      } else if (event.type === 'input_audio_buffer.committed') {
-        const committedInputTurn = inputTurn(event)
-        if (
-          inputTurns.isInvalid(event.item_id)
-          || committedInputTurn?.turnGeneration < committedTurnGeneration
-        ) {
-          inputTurns.invalidate(event.item_id)
-          return
-        }
-        userSpeaking = false
-        announcementWindow.endSpeech()
-        if (!inputTurns.isInvalid(event.item_id)) {
-          send(ws, {
-            type: 'voice.state',
-            state: 'processing',
-            turnId: committedInputTurn.turnId,
-            origin: 'model',
-          })
-        }
-      } else if (event.type === 'conversation.item.ambient_audio_transcription.completed') {
-        inputTurns.complete(event.item_id, currentTurn())
-      } else if (
-        event.type === 'conversation.item.input_audio_transcription.delta'
-        || event.type === 'conversation.item.input_audio_transcription.text'
-      ) {
-        if (inputTurns.isInvalid(event.item_id)) return
-        const transcriptTurn = inputTurns.resolve(event.item_id, currentTurn())
-        if (transcriptTurn?.turnGeneration < committedTurnGeneration) return
-        const transcript = streamingInputTranscript(event)
-        if (!transcriptTurn?.turnId || !transcript) return
-        send(ws, {
-          type: 'transcript.delta',
-          role: 'user',
-          content: transcript,
-          turnId: transcriptTurn.turnId,
-          replace: true,
-        })
-      } else if (event.type === 'conversation.item.input_audio_transcription.completed') {
-        const completedInput = inputTurns.complete(event.item_id, currentTurn())
-        const transcriptTurn = completedInput.context
-        if (
-          completedInput.invalid
-          || transcriptTurn?.turnGeneration < committedTurnGeneration
-        ) return
-        const transcript = String(event.transcript || '').trim()
-        if (!transcript) {
-          send(ws, {
-            type: 'transcript.discard',
-            role: 'user',
-            turnId: transcriptTurn.turnId,
-          })
-          return
-        }
-        commitTurn(transcriptTurn)
-        transcripts.record(transcriptTurn.turnId, transcript)
-        if (responseTurnCandidate === transcriptTurn) {
-          ensurePermissionResponseFor(transcriptTurn)
-        }
-        conversationService.record({
-          ownerId,
-          sessionId,
-          id: `voice:user:${transcriptTurn.turnId}`,
-          role: 'user',
-          content: transcript,
-          source: 'voice-user',
-          turnId: transcriptTurn.turnId,
-          inputs: inputAssets.metadataForParts(
-            transcripts.parts(transcriptTurn.turnId),
-          ),
-        })
-        send(ws, {
-          type: 'transcript.final',
-          role: 'user',
-          content: transcript,
-          turnId: transcriptTurn.turnId,
-        })
-      } else if (event.type === 'conversation.item.input_audio_transcription.failed') {
-        const failedInput = inputTurns.complete(event.item_id, currentTurn())
-        send(ws, {
-          type: 'transcript.discard',
-          role: 'user',
-          turnId: failedInput.context?.turnId,
-        })
-      } else if (event.type === 'response.created') {
-        // Lifecycle setup is handled before the event switch so providers that
-        // emit output before (or instead of) response.created follow this path.
-      } else if (event.type === 'response.function_call_arguments.done') {
+      if (isResponseActivityEvent(event)) presentationRuntime.begin(event)
+      if (inputs.handleProviderEvent(event)) return
+      if (event.type === 'response.function_call_arguments.done') {
         const id = realtimeResponseId(event)
-        const callContext = responseContexts.get(id)
+        const callContext = presentationRuntime.get(id)
           || { turnId: '', turnGeneration: -1 }
         logger.info('realtime.tool_call.received', {
           responseId: id,
@@ -1169,245 +791,18 @@ export function attachRealtimeGateway(server, {
           toolName: event.name || event.item?.name || '',
           turnId: callContext.turnId || '',
         })
-        if (responseContexts.has(id)) {
-          responseContexts.get(id).hasFunctionCall = true
-        }
+        presentationRuntime.markFunctionCall(id)
         toolCalls.handle(event, { ...callContext, responseId: id }).catch(error => {
           send(ws, { type: 'error', message: error.message })
         })
-      } else if (
-        event.type === 'response.audio.delta'
-        || event.type === 'response.output_audio.delta'
-      ) {
-        const id = realtimeResponseId(event)
-        const responseContext = ensureResponseContext(
-          responseContexts,
-          id,
-          fallbackResponseContext(),
-        )
-        if (responseContext?.suppressed) return
-        const responseTurnId = responseContext.turnId || turnId
-        if (id) {
-          responseContext.hasAudio = true
-          playbackTurns.set(id, responseTurnId)
-          announcementWindow.queueAudio(id, {
-            turnId: responseTurnId,
-            origin: responseContext.origin || 'model',
-          })
-        }
-        send(ws, {
-          type: 'audio.delta',
-          audio: event.delta,
-          sampleRate: Number(event.sampleRate)
-            || frontend.provider.outputSampleRate,
-          responseId: id,
-          turnId: responseTurnId,
-        })
-      } else if (
-        event.type === 'response.audio_transcript.delta'
-        || event.type === 'response.output_audio_transcript.delta'
-      ) {
-        const id = realtimeResponseId(event)
-        const context = ensureResponseContext(
-          responseContexts,
-          id,
-          fallbackResponseContext(),
-        )
-        if (context.suppressed) return
-        if (!context.playbackStarted) {
-          context.pendingTranscripts.push({
-            content: event.delta || '',
-            final: false,
-          })
-        } else {
-          emitAssistantTranscript({
-            id,
-            context,
-            content: event.delta || '',
-            final: false,
-          })
-        }
-      } else if (
-        event.type === 'response.audio_transcript.done'
-        || event.type === 'response.output_audio_transcript.done'
-      ) {
-        const id = realtimeResponseId(event)
-        const context = ensureResponseContext(
-          responseContexts,
-          id,
-          fallbackResponseContext(),
-        )
-        if (context.suppressed) return
-        context.transcriptDone = true
-        context.assistantTranscript = event.transcript || ''
-        if (!context.playbackStarted) {
-          context.pendingTranscripts.push({
-            content: event.transcript || '',
-            final: true,
-          })
-        } else {
-          emitAssistantTranscript({
-            id,
-            context,
-            content: event.transcript || '',
-            final: true,
-          })
-        }
-        finishResponseContextIfComplete(id, context)
-      } else if (event.type === 'response.text.delta') {
-        const id = realtimeResponseId(event)
-        const context = ensureResponseContext(
-          responseContexts,
-          id,
-          fallbackResponseContext(),
-        )
-        if (context.suppressed) return
-        emitAssistantTranscript({
-          id,
-          context,
-          content: event.delta || '',
-          final: false,
-        })
-      } else if (event.type === 'response.text.done') {
-        const id = realtimeResponseId(event)
-        const context = ensureResponseContext(
-          responseContexts,
-          id,
-          fallbackResponseContext(),
-        )
-        if (context.suppressed) return
-        context.transcriptDone = true
-        context.assistantTranscript = event.text || ''
-        emitAssistantTranscript({
-          id,
-          context,
-          content: event.text || '',
-          final: true,
-        })
-      } else if (event.type === 'response.done') {
-        const id = realtimeResponseId(event)
-        const responseContext = responseContexts.get(id)
-        const terminalToolResponse = toolCalls.consumeTerminalToolResponse(id)
-        const responseTurnId = responseContext?.turnId || turnId
-        const responseStatus = event.response?.status
-        const responseFailed = ['failed', 'cancelled', 'incomplete'].includes(
-          responseStatus,
-        )
-        toolCalls.finishToolResponse(id, {
-          suppressResponse: responseFailed
-            || Boolean(responseContext?.suppressed)
-            || Boolean(responseContext?.hasAudio)
-            || Boolean(responseContext?.assistantTranscript?.trim()),
-        }).catch(error => {
-          send(ws, { type: 'error', message: error.message })
-        })
-        // Guards run before the context is retired below, which drops the
-        // transcript they inspect. They can only ask the model to reconsider;
-        // they never execute tools or mutate task state directly.
-        const responseGuardDecision = evaluateResponseGuards({
-          origin: responseContext?.origin || 'model',
-          hasFunctionCall: Boolean(responseContext?.hasFunctionCall),
-          failed: responseFailed,
-          suppressed: Boolean(responseContext?.suppressed),
-          transcript: responseContext?.assistantTranscript || '',
-        })
-        if (!responseContext?.suppressed) {
-          send(ws, { type: 'audio.done', responseId: id, turnId: responseTurnId })
-          if (!responseContext?.hasAudio) {
-            send(ws, {
-              type: 'voice.state',
-              state: 'idle',
-              turnId: responseTurnId,
-              origin: responseContext?.origin || 'model',
-            })
-          }
-        }
-        if (responseContext?.hasAudio && !responseFailed) {
-          responseContext.responseDone = true
-          finishResponseContextIfComplete(id, responseContext)
-        } else {
-          const completedNonVoiceAnnouncement = (
-            responseContext?.origin === 'announcement'
-            && nonVoiceClient
-            && !responseFailed
-          )
-          const completedNonVoiceTaskNotification = (
-            responseContext?.consumesTaskNotification
-            && nonVoiceClient
-            && !responseFailed
-          )
-          if (
-            responseContext
-            && !responseFailed
-            && (
-              responseContext.origin !== 'announcement'
-              || completedNonVoiceAnnouncement
-            )
-          ) {
-            flushPendingTranscripts(id, responseContext)
-          }
-          if (responseContext?.origin === 'announcement') {
-            if (completedNonVoiceAnnouncement) {
-              announcements.confirmMany(contextTaskIds(responseContext))
-            } else {
-              announcements.retryMany(contextTaskIds(responseContext))
-            }
-          } else if (completedNonVoiceTaskNotification) {
-            announcements.confirmMany(contextTaskIds(responseContext))
-          }
-          responseContexts.delete(id)
-        }
-        if (responseFailed && id) {
-          playbackTurns.delete(id)
-          announcementWindow.finishPlayback(id, {
-            hasFunctionCall: Boolean(responseContext?.hasFunctionCall),
-          })
-        }
-        announcementWindow.responseDone({
-          turnId: responseTurnId,
-          origin: responseContext?.origin || 'model',
-          hasAudio: Boolean(responseContext?.hasAudio),
-          hasFunctionCall: Boolean(responseContext?.hasFunctionCall),
-          suppressed: Boolean(responseContext?.suppressed) || terminalToolResponse,
-          failed: responseFailed,
-        })
-        if (
-          responseGuardDecision
-          && outputEnabled
-          && frontend?.ready
-          && frontend.capabilities.perResponseInstructions
-        ) {
-          const correctionFrontend = frontend
-          const correctionGeneration = responseContext?.turnGeneration
-          correctionFrontend.ensureResponse({
-            turnId: responseTurnId,
-            turnGeneration: correctionGeneration,
-          }, {
-            shouldCreate: () => isResponseGuardTurnCurrent({
-              sameFrontend: frontend === correctionFrontend,
-              outputEnabled,
-              userSpeaking,
-              responseTurnId,
-              responseTurnGeneration: correctionGeneration,
-              committedTurnId,
-              committedTurnGeneration,
-            }),
-            response: {
-              instructions: responseGuardDecision.instructions,
-            },
-          }).catch(error => send(ws, { type: 'error', message: error.message }))
-        }
-        const timer = setTimeout(
-          () => announcements.flush(),
-          config.announcementQuietMs,
-        )
-        timer.unref?.()
+      } else if (presentationRuntime.handle(event)) {
+        return
       } else if (event.type === 'error') {
         // A response refused by a busy single-slot provider is retried by the
         // frontend transparently; nothing user-facing happened.
         if (event.__voiceRetried) return
         const errorMessage = realtimeEventErrorMessage(event)
-        const providerError = frontend.provider.classifyError(errorMessage)
+        const providerError = realtimeSession.classifyError(errorMessage)
         const recoverableInactivity = providerError === 'inactivity'
         // A local or otherwise capacity-bounded provider can still be draining
         // the previous Session. Its close event drives the shared reconnect
@@ -1428,58 +823,19 @@ export function attachRealtimeGateway(server, {
         if (benignCancelRace) return
         if (providerError === 'fatal') {
           connectionLogger.error('realtime.blocked', {
-            provider: sessionProvider,
+            provider: realtimeSession.providerKey,
             classification: providerError,
             errorMessage,
           })
-          realtimeBlockedError = errorMessage
-          pendingAudio = []
-          cancelScheduledRealtimeReconnect()
-          const blockedFrontend = frontend
-          frontend = null
-          blockedFrontend?.close()
+          realtimeSession.block(errorMessage)
           send(ws, {
             type: GatewayServerEvent.VOICE_CONNECTION,
             state: 'unavailable',
-            provider: sessionProvider,
+            provider: realtimeSession.providerKey,
             message: errorMessage,
           })
         }
-        const id = realtimeResponseId(event)
-        const context = responseContexts.get(id)
-        if (context?.origin === 'announcement') {
-          send(ws, { type: 'playback.clear' })
-          announcementWindow.finishPlayback(id)
-          playbackTurns.delete(id)
-          responseContexts.delete(id)
-          announcements.retryMany(contextTaskIds(context))
-        } else {
-          if (id && context?.hasAudio) {
-            send(ws, {
-              type: 'audio.done',
-              responseId: id,
-              turnId: context.turnId || turnId,
-            })
-          }
-          if (id && context?.hasAudio) {
-            scheduleResponseContextCleanup(id, context)
-          } else if (id) {
-            responseContexts.delete(id)
-            playbackTurns.delete(id)
-          }
-          announcementWindow.responseDone({
-            turnId: context?.turnId || turnId,
-            origin: context?.origin || 'model',
-            hasAudio: Boolean(context?.hasAudio),
-            hasFunctionCall: Boolean(context?.hasFunctionCall),
-            failed: true,
-          })
-        }
-        const timer = setTimeout(
-          () => announcements.flush(),
-          config.announcementQuietMs,
-        )
-        timer.unref?.()
+        presentationRuntime.failResponse(event)
         // A provider may close an inactive response scope while a delegated
         // backend task is still running. The task remains healthy, and any
         // pending announcement has already returned to the retry queue, so this
@@ -1490,186 +846,14 @@ export function attachRealtimeGateway(server, {
       }
     }
 
-    const connectFrontendNow = () => {
-      if (frontend?.ready) return Promise.resolve()
-      if (connectPromise) return connectPromise
-      send(ws, {
-        type: GatewayServerEvent.VOICE_CONNECTION,
-        state: 'connecting',
-        provider: sessionProvider,
-      })
-      const connectStartedAt = Date.now()
-      connectionLogger.info('realtime.connecting', {
-        provider: sessionProvider,
-      })
-      let createdFrontend
-      createdFrontend = createRealtimeFrontend({
-        providerName: sessionProvider,
-        providerRegistry: realtimeProviderRegistry,
-        agentContext: {
-          client: clientContext,
-          memories: memoryService?.list(ownerId, { limit: 64 }) || [],
-          recentMessages: conversationService.frontendContext({ ownerId, sessionId }),
-        },
-        onEvent: handleEvent,
-        onDiagnostic: diagnostic => {
-          const { event, ...fields } = diagnostic
-          connectionLogger.warn(event, fields)
-        },
-        onError: error => {
-          // Closing a frontend while it is still handshaking is expected when
-          // the client enters sleep or reconnects. Its late socket error
-          // belongs to the detached frontend and must not mark the live voice
-          // client unavailable.
-          if (frontend !== createdFrontend) return
-          const classification = createdFrontend.provider.classifyError(error.message)
-          if (classification !== 'inactivity') {
-            connectionLogger.warn('realtime.provider_error', {
-              provider: createdFrontend.provider.key,
-              classification,
-              error,
-            })
-          }
-          if (classification === 'fatal') {
-            realtimeBlockedError = error.message
-            pendingAudio = []
-            error.realtimeConnectionReported = true
-          }
-          // capacity_busy 是瞬时可恢复错误（如 s2s 单 session 槽异步未释放），
-          // 由上层 wakeFromSleep 带退避重试，不向客户端报错以保持唤醒流程静默。
-          if (classification !== 'inactivity' && classification !== 'capacity_busy') {
-            reportFrontendError(error)
-          }
-        },
-        onClose: () => {
-          if (frontend !== createdFrontend) return
-          connectionLogger.warn('realtime.closed', {
-            provider: createdFrontend.provider.key,
-            connectedMs: realtimeConnectedAt
-              ? Date.now() - realtimeConnectedAt
-              : 0,
-            blocked: Boolean(realtimeBlockedError),
-          })
-          send(ws, { type: 'voice.state', state: 'idle' })
-          frontend = null
-          if (!inputEnabled && !outputEnabled) return
-          send(ws, {
-            type: GatewayServerEvent.VOICE_CONNECTION,
-            state: 'unavailable',
-            provider: sessionProvider,
-            ...(realtimeBlockedError ? { message: realtimeBlockedError } : {}),
-          })
-          if (realtimeBlockedError) return
-          if (
-            realtimeConnectedAt
-            && Date.now() - realtimeConnectedAt >= REALTIME_STABLE_CONNECTION_MS
-          ) {
-            realtimeReconnectBackoff.reset()
-          }
-          realtimeConnectedAt = 0
-          scheduleRealtimeReconnect()
-            .then(() => announcements.flush())
-            .catch(error => send(ws, {
-              type: 'error',
-              message: `实时语音连接恢复失败：${error.message}`,
-            }))
-        },
-      })
-      frontend = createdFrontend
-      let createdConnectPromise
-      createdConnectPromise = createdFrontend.connect()
-        .then(() => {
-          if (frontend !== createdFrontend) return
-          realtimeBlockedError = ''
-          realtimeConnectedAt = Date.now()
-          connectionLogger.info('realtime.connected', {
-            provider: createdFrontend.provider.key,
-            durationMs: realtimeConnectedAt - connectStartedAt,
-          })
-          const resumedFromSleep = waking
-          waking = false
-          send(ws, {
-            type: GatewayServerEvent.VOICE_CONNECTION,
-            state: 'connected',
-            provider: createdFrontend.provider.key,
-          })
-          announcePendingPermissions()
-          pendingAudio.forEach(audio => createdFrontend.appendAudio(audio))
-          pendingAudio = []
-          if (outputEnabled) claimPendingNotifications()
-          send(ws, {
-            type: 'voice.ready',
-            inputSampleRate: createdFrontend.provider.inputSampleRate,
-            provider: createdFrontend.provider.key,
-            providerLabel: createdFrontend.provider.label,
-          })
-          prepareSleepMode()
-          sleepController.recordActivity()
-          if (resumedFromSleep) {
-            send(ws, {
-              type: GatewayServerEvent.VOICE_SLEEP,
-              state: 'awake',
-              wakeWord: config.wakeWord,
-            })
-            announcePendingPermissions()
-            claimPendingNotifications()
-            announcements.flush()
-          }
-        })
-        .catch(error => {
-          if (frontend !== createdFrontend) return
-          connectionLogger.error('realtime.connect_failed', {
-            provider: createdFrontend.provider.key,
-            durationMs: Date.now() - connectStartedAt,
-            error,
-          })
-          const classification = createdFrontend.provider.classifyError(error.message)
-          if (classification === 'fatal') {
-            realtimeBlockedError = error.message
-            pendingAudio = []
-          }
-          // capacity_busy 是瞬时可恢复错误（如 s2s 单 session 槽尚未释放），
-          // 由上层带退避重试，不向客户端报 unavailable 以避免唤醒流程闪烁。
-          if (frontend === createdFrontend && classification !== 'capacity_busy') {
-            send(ws, {
-              type: GatewayServerEvent.VOICE_CONNECTION,
-              state: 'unavailable',
-              provider: createdFrontend.provider.key,
-              message: error.message,
-            })
-          }
-          throw error
-        })
-        .finally(() => {
-          if (connectPromise === createdConnectPromise) connectPromise = null
-        })
-      connectPromise = createdConnectPromise
-      return createdConnectPromise
-    }
-
-    const ensureFrontend = () => {
-      if (realtimeBlockedError) {
-        return Promise.reject(new Error(realtimeBlockedError))
-      }
-      if (frontend?.ready) return Promise.resolve()
-      if (connectPromise) return connectPromise
-      if (scheduledRealtimeReconnect) {
-        return scheduledRealtimeReconnect.promise
-      }
-      return connectFrontendNow()
-    }
-
     const enterSleep = () => {
       if (sleeping) return
       sleeping = true
       waking = false
-      pendingAudio = []
       announcementWindow.reset()
+      progressAnnouncements.clear()
       wakeDetector?.reset()
-      cancelScheduledRealtimeReconnect()
-      const staleFrontend = frontend
-      frontend = null
-      staleFrontend?.close()
+      realtimeSession.close()
       if (clientContext.states?.includes('sleeping')) {
         send(ws, {
           type: GatewayServerEvent.CLIENT_STATE,
@@ -1679,7 +863,7 @@ export function attachRealtimeGateway(server, {
       send(ws, {
         type: GatewayServerEvent.VOICE_CONNECTION,
         state: 'sleeping',
-        provider: sessionProvider,
+        provider: realtimeSession.providerKey,
       })
       send(ws, {
         type: GatewayServerEvent.VOICE_SLEEP,
@@ -1739,7 +923,7 @@ export function attachRealtimeGateway(server, {
       if (!config.wakeWordEnabled || nonVoiceClient) return false
       explicitSleepRequested = true
       inputEnabled = false
-      pendingAudio = []
+      realtimeSession.clearPendingAudio()
       prepareSleepMode()
       const finish = () => {
         if (!explicitSleepRequested || !wakeDetector) return false
@@ -1755,11 +939,9 @@ export function attachRealtimeGateway(server, {
     const WAKE_CONNECT_RETRY_BACKOFF_MS = 350
 
     const attemptWakeConnect = attempt => {
-      ensureFrontend().catch(error => {
-        const provider =
-          frontend?.provider ?? realtimeProviderRegistry.resolve(sessionProvider)
-        const classification =
-          provider.classifyError?.(error.message) ?? 'other'
+      realtimeSession.ensure().catch(error => {
+        const provider = realtimeSession.provider()
+        const classification = realtimeSession.classifyError(error.message)
         if (
           classification === 'capacity_busy'
           && attempt < WAKE_CONNECT_MAX_ATTEMPTS
@@ -1770,9 +952,7 @@ export function attachRealtimeGateway(server, {
             error: error.message,
           })
           // 先放弃失败的前端，避免其异步 onClose 干扰下一次重试。
-          const failedFrontend = frontend
-          frontend = null
-          failedFrontend?.close()
+          realtimeSession.detach({ clearAudio: false })
           setTimeout(
             () => attemptWakeConnect(attempt + 1),
             WAKE_CONNECT_RETRY_BACKOFF_MS,
@@ -1782,14 +962,11 @@ export function attachRealtimeGateway(server, {
         waking = false
         sleeping = true
         sleepController.holdSleeping()
-        cancelScheduledRealtimeReconnect()
-        const failedFrontend = frontend
-        frontend = null
-        failedFrontend?.close()
+        realtimeSession.close()
         send(ws, {
           type: GatewayServerEvent.VOICE_CONNECTION,
           state: 'sleeping',
-          provider: sessionProvider,
+          provider: realtimeSession.providerKey,
           message: error.message,
         })
       })
@@ -1809,97 +986,9 @@ export function attachRealtimeGateway(server, {
       attemptWakeConnect(0)
     }
 
-    const submitInputMessage = event => {
-      let parts
-      try {
-        parts = withAttachmentAnchors(normalizeInputParts(
-          event.parts,
-          { fallbackText: event.text },
-        ))
-      } catch (error) {
-        send(ws, { type: GatewayServerEvent.ERROR, message: error.message })
-        return
-      }
-      const inputTurnId = `text_${randomUUID().replaceAll('-', '')}`
-      parts = inputAssets.registerParts({
-        ownerId,
-        sessionId,
-        turnId: inputTurnId,
-        parts,
-      })
-      const text = inputText(parts)
-      const display = displayInputText(parts)
-      const supersededVoiceTurn = userSpeaking ? currentTurn() : null
-      userSpeaking = false
-      turnGeneration = ++turnSequence
-      turnId = inputTurnId
-      manualInputGeneration = turnGeneration
-      inputTurns.invalidateBeforeGeneration(turnGeneration)
-      const inputContext = currentTurn()
-      commitTurn(inputContext)
-      clearResponseCandidate()
-      // Text and attachment submissions are first-class user turns. They must
-      // close any result announcement still occupying the previous turn and
-      // block a newly completed task from speaking over the response now being
-      // generated, just like input_audio_buffer.speech_started does for voice.
-      announcementWindow.beginTurn(inputTurnId)
-      announcementWindow.endSpeech()
-      announcements.dismissActive()
-      send(ws, {
-        type: GatewayServerEvent.PLAYBACK_CLEAR,
-        reason: 'user_interruption',
-      })
-      if (supersededVoiceTurn?.turnId) {
-        send(ws, {
-          type: GatewayServerEvent.TRANSCRIPT_DISCARD,
-          role: 'user',
-          turnId: supersededVoiceTurn.turnId,
-          reason: 'superseded_by_manual_input',
-        })
-      }
-      send(ws, { type: GatewayServerEvent.TURN_STARTED, turnId: inputTurnId })
-      send(ws, {
-        type: GatewayServerEvent.VOICE_STATE,
-        state: 'processing',
-        turnId: inputTurnId,
-        origin: 'model',
-      })
-      frontend?.cancel()
-      transcripts.record(inputTurnId, text || display)
-      transcripts.recordParts(inputTurnId, inputFileParts(parts))
-      conversationService.record({
-        ownerId,
-        sessionId,
-        id: `voice:user:${inputTurnId}`,
-        role: 'user',
-        content: display,
-        source: 'text-user',
-        turnId: inputTurnId,
-        inputs: inputAssets.metadataForParts(parts),
-      })
-      send(ws, {
-        type: GatewayServerEvent.TRANSCRIPT_FINAL,
-        role: 'user',
-        content: display,
-        turnId: inputTurnId,
-      })
-      ensureFrontend()
-        .then(() => frontend.sendUserInput(
-          parts,
-          inputContext,
-        ))
-        .catch(error => {
-          if (manualInputGeneration === inputContext.turnGeneration) {
-            manualInputGeneration = null
-          }
-          reportFrontendError(error)
-        })
-    }
-
     const acceptSleepingAudio = audio => {
       try {
-        const sampleRate = realtimeProviderRegistry.resolve(sessionProvider)
-          .inputSampleRate
+        const sampleRate = realtimeSession.provider().inputSampleRate
         if (wakeDetector?.accept(audio, sampleRate)) wakeFromSleep()
       } catch (error) {
         sleeping = false
@@ -1910,7 +999,7 @@ export function attachRealtimeGateway(server, {
           state: 'disabled',
           message: `唤醒词检测已停止：${error.message}`,
         })
-        ensureFrontend().catch(connectionError => send(ws, {
+        realtimeSession.ensure().catch(connectionError => send(ws, {
           type: 'error',
           message: connectionError.message,
         }))
@@ -1922,10 +1011,10 @@ export function attachRealtimeGateway(server, {
       canSleep: () => (
         (inputEnabled || config.wakeWordEnabled)
         && activeVoiceClients.isActive(ownerId, voiceClient)
-        && frontend?.ready
-        && !userSpeaking
+        && realtimeSession.ready
+        && !turns.userSpeaking
         && !announcementWindow.isBlocked()
-        && !connectPromise
+        && !realtimeSession.connecting
         && !waking
       ),
       onSleep: enterSleep,
@@ -1950,6 +1039,7 @@ export function attachRealtimeGateway(server, {
       } catch {
         return
       }
+      if (!isGatewayClientEvent(event)) return
       if (String(event.type || '').startsWith('dictation.')) {
         if (event.type === GatewayClientEvent.DICTATION_START) {
           if (inputSuspended) {
@@ -1978,7 +1068,7 @@ export function attachRealtimeGateway(server, {
           dictationPreviousInputEnabled = previousInputEnabled
           dictationOwnsInput = true
           inputEnabled = false
-          pendingAudio = []
+          realtimeSession.clearPendingAudio()
         }
         if (!accepted && event.type === GatewayClientEvent.DICTATION_START) {
           if (dictationSession.snapshot().state !== 'error') {
@@ -1997,7 +1087,7 @@ export function attachRealtimeGateway(server, {
         connectionLogger.info('voice_client.configured', {
           clientType: descriptor.type,
           clientLabel: descriptor.label,
-          requestedProvider: event.provider || sessionProvider,
+          requestedProvider: event.provider || realtimeSession.providerKey,
           inputEnabled: event.inputEnabled === true,
           outputEnabled: event.outputEnabled === true,
           textOnly: event.textOnly === true,
@@ -2006,16 +1096,9 @@ export function attachRealtimeGateway(server, {
         // The client may pick a realtime front end per session. An unknown
         // name is reported instead of silently falling back, so a typo does
         // not look like a working session on the wrong provider.
-        if (event.provider && event.provider !== sessionProvider) {
+        if (event.provider && event.provider !== realtimeSession.providerKey) {
           try {
-            const requested = realtimeProviderRegistry.resolve(event.provider)
-            sessionProvider = requested.key
-            realtimeBlockedError = ''
-            const staleFrontend = frontend
-            frontend = null
-            cancelScheduledRealtimeReconnect()
-            connectPromise = null
-            staleFrontend?.close()
+            realtimeSession.switchProvider(event.provider)
           } catch (error) {
             send(ws, { type: 'error', message: error.message })
             return
@@ -2067,20 +1150,21 @@ export function attachRealtimeGateway(server, {
             ? 0
             : config.sleepTimeoutMs,
         )
-        frontend?.updateAgentContext({
-          client: clientContext,
-        })
-        if (sleeping) {
-          sleeping = false
-          waking = true
-          sleepController.wake()
-        }
-        prepareSleepMode()
-        if (event.wakeWordOnly === true) {
-          requestExplicitSleep()
-        } else if (inputEnabled || outputEnabled) {
-          ensureFrontend().catch(reportFrontendError)
-        }
+        frontendToolSourcesReady.then(() => {
+          if (ws.readyState !== WebSocket.OPEN) return
+          realtimeSession.updateAgentContext(getAgentContext())
+          if (sleeping) {
+            sleeping = false
+            waking = true
+            sleepController.wake()
+          }
+          prepareSleepMode()
+          if (event.wakeWordOnly === true) {
+            requestExplicitSleep()
+          } else if (inputEnabled || outputEnabled) {
+            realtimeSession.ensure().catch(reportFrontendError)
+          }
+        }).catch(reportFrontendError)
       } else if (event.type === GatewayClientEvent.UNMUTE) {
         explicitSleepRequested = false
         if (nonVoiceClient) {
@@ -2090,7 +1174,7 @@ export function attachRealtimeGateway(server, {
         } else {
           activateVoiceClient({ takeover: event.takeover === true })
         }
-        ensureFrontend()
+        realtimeSession.ensure()
           .then(() => {
             prepareSleepMode()
             announcePendingPermissions()
@@ -2112,7 +1196,7 @@ export function attachRealtimeGateway(server, {
           prepareSleepMode()
           return
         }
-        ensureFrontend()
+        realtimeSession.ensure()
           .then(() => {
             prepareSleepMode()
             announcePendingPermissions()
@@ -2134,19 +1218,7 @@ export function attachRealtimeGateway(server, {
         ) {
           return
         }
-        if (frontend?.ready) frontend.appendAudio(event.audio)
-        else {
-          pendingAudio.push(event.audio)
-          if (pendingAudio.length > MAX_PENDING_AUDIO_CHUNKS) {
-            pendingAudio.splice(0, pendingAudio.length - MAX_PENDING_AUDIO_CHUNKS)
-          }
-          // CONNECT/onClose owns connection establishment and retries. Audio
-          // arriving during a close/backoff window is buffered, but must never
-          // bypass that window and create a second Realtime connection.
-          if (!connectPromise && !scheduledRealtimeReconnect) {
-            ensureFrontend().catch(reportFrontendError)
-          }
-        }
+        realtimeSession.appendAudio(event.audio)
       } else if (
         event.type === GatewayClientEvent.TEXT_MESSAGE
         || event.type === GatewayClientEvent.INPUT_MESSAGE
@@ -2159,36 +1231,35 @@ export function attachRealtimeGateway(server, {
           return
         }
         sleepController.recordActivity()
-        submitInputMessage(event)
+        inputs.submit(event)
       } else if (event.type === GatewayClientEvent.INTERRUPT) {
         sleepController.recordActivity()
-        turnGeneration = ++turnSequence
-        committedTurnGeneration = turnGeneration
+        turns.advanceBoundary()
         announcementWindow.interrupt()
         announcements.dismissActive()
-        frontend?.cancel()
+        realtimeSession.cancelResponse()
       } else if (event.type === GatewayClientEvent.PLAYBACK_STARTED) {
         const id = String(event.responseId || '')
         if (acceptsPlaybackReceipt({
           outputEnabled,
           active: activeVoiceClients.isActive(ownerId, voiceClient),
-          responseKnown: responseContexts.has(id),
-        })) startPlayback(id)
+          responseKnown: presentationRuntime.has(id),
+        })) presentationRuntime.startPlayback(id)
       } else if (event.type === GatewayClientEvent.PLAYBACK_ENDED) {
         const id = String(event.responseId || '')
         if (acceptsPlaybackReceipt({
           outputEnabled,
           active: activeVoiceClients.isActive(ownerId, voiceClient),
-          responseKnown: responseContexts.has(id),
-        })) finishPlayback(id)
+          responseKnown: presentationRuntime.has(id),
+        })) presentationRuntime.finishPlayback(id)
       } else if (event.type === GatewayClientEvent.PLAYBACK_CANCELLED) {
         const id = String(event.responseId || '')
         if (acceptsPlaybackReceipt({
           outputEnabled,
           active: activeVoiceClients.isActive(ownerId, voiceClient),
-          responseKnown: responseContexts.has(id),
+          responseKnown: presentationRuntime.has(id),
         })) {
-          cancelQueuedPlayback(id, {
+          presentationRuntime.cancelPlayback(id, {
             reason: String(event.reason || ''),
           })
         }
@@ -2198,15 +1269,13 @@ export function attachRealtimeGateway(server, {
         sleeping = false
         waking = false
         sleepController?.disable()
-        turnGeneration = ++turnSequence
-        committedTurnGeneration = turnGeneration
-        pendingAudio = []
+        turns.advanceBoundary()
         announcementWindow.reset()
-        cancelScheduledRealtimeReconnect()
-        frontend?.close()
+        progressAnnouncements.clear()
+        realtimeSession.close({ notifyDisconnected: true })
       } else if (event.type === GatewayClientEvent.INPUT_MUTE) {
         inputEnabled = false
-        pendingAudio = []
+        realtimeSession.clearPendingAudio()
       } else if (event.type === GatewayClientEvent.SLEEP) {
         requestExplicitSleep()
       } else if (event.type === GatewayClientEvent.WAKE) {
@@ -2234,18 +1303,17 @@ export function attachRealtimeGateway(server, {
       if (!connections?.size) voiceConnections.delete(ownerId)
       unsubscribeTasks()
       clearResponseCandidate()
-      turnGeneration = ++turnSequence
-      committedTurnGeneration = turnGeneration
+      turns.close()
       transcripts.close()
+      turnCitations.clear()
       announcementWindow.reset()
-      playbackTurns.clear()
-      inputTurns.clear()
+      presentationRuntime.clear()
       announcements.close()
+      progressAnnouncements.close()
       clearTimeout(permissionRetryTimer)
       permissionRetryTimer = null
-      cancelScheduledRealtimeReconnect()
       sleepController?.close()
-      frontend?.close()
+      realtimeSession.close()
       // Invisible memory: distil durable personal facts from this session in
       // the background. All gating (debounce, minimum turns, disabled state)
       // lives inside the extractor; it never blocks or breaks the close path,

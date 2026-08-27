@@ -29,6 +29,45 @@ test('keeps recent voice context isolated by owner and voice session', () => {
   )
 })
 
+test('uses the same bounded ten-message projection for frontend history and Realtime', () => {
+  const sync = new ConversationSync()
+  for (let index = 1; index <= 12; index += 1) {
+    sync.record({
+      ownerId: 'owner',
+      sessionId: 'voice',
+      id: `message-${index}`,
+      role: index % 2 ? 'user' : 'assistant',
+      content: `message ${index}`,
+      source: index % 2 ? 'voice-user' : 'realtime-direct',
+    })
+  }
+
+  assert.deepEqual(
+    sync.frontendContext({ ownerId: 'owner', sessionId: 'voice' })
+      .map(message => message.content),
+    Array.from({ length: 10 }, (_, index) => `message ${index + 3}`),
+  )
+})
+
+test('restores messages without writing them back through the record observer', () => {
+  const observed = []
+  const sync = new ConversationSync({ onRecord: message => observed.push(message) })
+  sync.restore({
+    ownerId: 'owner',
+    sessionId: 'voice',
+    messages: [{
+      id: 'restored',
+      role: 'user',
+      content: 'persisted message',
+      source: 'voice-user',
+      createdAt: 123,
+    }],
+  })
+
+  assert.equal(observed.length, 0)
+  assert.equal(sync.frontendContext({ ownerId: 'owner', sessionId: 'voice' })[0].createdAt, 123)
+})
+
 test('deduplicates the same message id and retains agent presentations', () => {
   const sync = new ConversationSync()
   const input = {
@@ -46,6 +85,34 @@ test('deduplicates the same message id and retains agent presentations', () => {
   assert.equal(
     sync.frontendContext({ ownerId: 'owner', sessionId: 'voice' })[0].content,
     '完成',
+  )
+})
+
+test('clones citations and preserves them across a duplicate final record', () => {
+  const sync = new ConversationSync()
+  const citations = [{
+    id: 'source_1',
+    title: '杭州天气',
+    url: 'https://example.com/weather',
+  }]
+  const base = {
+    ownerId: 'owner',
+    sessionId: 'voice',
+    id: 'answer',
+    role: 'assistant',
+    content: '今天晴。',
+    source: 'realtime-direct',
+  }
+  sync.record({ ...base, citations })
+  citations[0].title = '被篡改'
+  sync.record(base)
+
+  const [message] = sync.list({ ownerId: 'owner', sessionId: 'voice' })
+  assert.equal(message.citations[0].title, '杭州天气')
+  message.citations[0].title = '再次篡改'
+  assert.equal(
+    sync.list({ ownerId: 'owner', sessionId: 'voice' })[0].citations[0].title,
+    '杭州天气',
   )
 })
 

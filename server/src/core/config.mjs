@@ -14,6 +14,10 @@ import {
 import {
   resolveRealtimeFrontendConfiguration,
 } from '../../../shared/realtime-provider-catalog.mjs'
+import {
+  loadFrontendProfile,
+  resolveFrontendProfileConfiguration,
+} from './frontend-profile.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const sourceRoot = resolve(here, '../../..')
@@ -97,6 +101,34 @@ export function resolveBackendModels(env = process.env) {
   }
 }
 
+export function resolveWebSearchConfiguration(env = process.env) {
+  const bailianMcpUrl = 'https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp'
+  const explicitMcpUrl = String(env.QWEN_AUDIO_WEB_SEARCH_MCP_URL || '').trim()
+  const dashscopeApiKey = String(env.DASHSCOPE_API_KEY || '').trim()
+  const requestedProvider = String(
+    env.QWEN_AUDIO_WEB_SEARCH_PROVIDER || '',
+  ).trim().toLowerCase()
+  const provider = requestedProvider || (explicitMcpUrl ? 'mcp' : 'so360')
+  if (!['bailian', 'bing', 'mcp', 'none', 'so360'].includes(provider)) {
+    throw new Error(
+      '不支持的 Web Search Provider：'
+      + `${provider}（可选 bailian、bing、mcp、none、so360）`,
+    )
+  }
+  const mcpUrl = provider === 'bailian' ? bailianMcpUrl : explicitMcpUrl
+  const usesBailianMcp = provider === 'bailian'
+  return {
+    provider,
+    mcpUrl,
+    mcpToken: String(
+      env.QWEN_AUDIO_WEB_SEARCH_MCP_TOKEN
+      || (usesBailianMcp ? dashscopeApiKey : ''),
+    ).trim(),
+    mcpTool: String(env.QWEN_AUDIO_WEB_SEARCH_MCP_TOOL || '').trim()
+      || (usesBailianMcp ? 'bailian_web_search' : 'web_search'),
+  }
+}
+
 const configuredAgentProtocol = normalizeBackendProtocol(
   process.env.AGENT_PROTOCOL,
 )
@@ -164,6 +196,16 @@ export function resolveOpenCodeCoordinatorAgent(env = process.env) {
 }
 
 const realtimeFrontend = resolveRealtimeFrontendConfiguration(process.env)
+const webSearch = resolveWebSearchConfiguration(process.env)
+const loadedFrontendProfile = loadFrontendProfile({
+  filePath: process.env.QWEN_AUDIO_FRONTEND_PROFILE,
+})
+const frontendProfileConfiguration = resolveFrontendProfileConfiguration({
+  profile: loadedFrontendProfile,
+  env: process.env,
+  defaultAssistantProfilePath: runtimeEnvironment.assistantProfilePath,
+  baseDirectory: root,
+})
 
 export const config = {
   root,
@@ -217,6 +259,13 @@ export const config = {
     45_000,
     { min: 1_000, max: 300_000 },
   ),
+  webSearchProvider: webSearch.provider,
+  webSearchMcpUrl: webSearch.mcpUrl,
+  webSearchMcpToken: webSearch.mcpToken,
+  webSearchMcpTool: webSearch.mcpTool,
+  frontendProfile: frontendProfileConfiguration.frontendProfile,
+  frontendMcpConfigPath: frontendProfileConfiguration.frontendMcpConfigPath,
+  frontendOpenApiConfigPath: frontendProfileConfiguration.frontendOpenApiConfigPath,
   allowedOrigins: String(process.env.QWEN_AUDIO_AGENT_ALLOWED_ORIGINS || '')
     .split(',')
     .map(value => value.trim())
@@ -391,9 +440,7 @@ export const config = {
   frontendPromptDir: process.env.QWEN_AUDIO_AGENT_FRONTEND_PROMPT_DIR
     ? resolve(root, process.env.QWEN_AUDIO_AGENT_FRONTEND_PROMPT_DIR)
     : resolve(root, 'config/frontend-agent'),
-  assistantProfilePath: process.env.QWEN_AUDIO_AGENT_ASSISTANT_PROFILE_PATH
-    ? resolve(root, process.env.QWEN_AUDIO_AGENT_ASSISTANT_PROFILE_PATH)
-    : runtimeEnvironment.assistantProfilePath,
+  assistantProfilePath: frontendProfileConfiguration.assistantProfilePath,
   frontendMemoryPath: process.env.QWEN_AUDIO_AGENT_MEMORY_PATH
     ? resolve(root, process.env.QWEN_AUDIO_AGENT_MEMORY_PATH)
     : process.env.QWEN_AUDIO_AGENT_FRONTEND_MEMORY_PATH
@@ -496,12 +543,6 @@ export const config = {
     process.env.QWEN_AUDIO_AGENT_SCHEDULED_TASK_TIMEOUT_MS,
     1_800_000,
     { min: 60_000 },
-  ),
-  backgroundTaskProgressCheckMs: numberSetting(
-    process.env.QWEN_AUDIO_AGENT_BACKGROUND_TASK_PROGRESS_CHECK_MS
-      || process.env.QWEN_AUDIO_AGENT_SCHEDULED_TASK_PROGRESS_CHECK_MS,
-    300_000,
-    { min: 30_000 },
   ),
   offlineNotificationDelayMs: numberSetting(
     process.env.QWEN_AUDIO_AGENT_OFFLINE_NOTIFICATION_DELAY_MS,

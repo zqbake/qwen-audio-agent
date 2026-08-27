@@ -6,6 +6,8 @@ import {
   GatewayClientEvent,
   GatewayServerEvent,
   GatewayTaskEvent,
+  isGatewayClientEvent,
+  isGatewayServerEvent,
 } from '../shared/realtime-events.mjs'
 
 test('keeps Gateway realtime event names unique within each direction', () => {
@@ -48,4 +50,30 @@ test('defines the shared sleep wake lifecycle', () => {
     'wake',
     'voice.sleep',
   ])
+})
+
+test('defines every task event consumed by Gateway clients', () => {
+  assert.deepEqual([
+    GatewayTaskEvent.SNAPSHOT,
+    GatewayTaskEvent.ACCEPTED,
+    GatewayTaskEvent.NOTIFICATION_PENDING,
+    GatewayTaskEvent.NOTIFICATION_DELIVERED,
+  ], [
+    'task.snapshot',
+    'task.accepted',
+    'task.notification.pending',
+    'task.notification.delivered',
+  ])
+  for (const event of Object.values(GatewayTaskEvent)) {
+    assert.equal(GATEWAY_SERVER_EVENT_TYPES.has(event), true)
+  }
+})
+
+test('recognizes event direction without throwing on malformed input', () => {
+  assert.equal(isGatewayClientEvent({ type: 'connect' }), true)
+  assert.equal(isGatewayClientEvent({ type: 'voice.ready' }), false)
+  assert.equal(isGatewayClientEvent(null), false)
+  assert.equal(isGatewayServerEvent({ type: 'voice.ready' }), true)
+  assert.equal(isGatewayServerEvent({ type: 'task.accepted' }), true)
+  assert.equal(isGatewayServerEvent('voice.ready'), false)
 })
